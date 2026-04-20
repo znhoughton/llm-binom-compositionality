@@ -44,7 +44,6 @@ import pandas as pd
 import torch
 from scipy.linalg import orthogonal_procrustes
 from tqdm import tqdm
-from anthropic import Anthropic
 from huggingface_hub import HfApi
 from transformers import AutoTokenizer, AutoModel
 
@@ -76,9 +75,9 @@ RETRY_WAIT       = 10
 REQUEST_BUFFER   = 20
 MAX_PER_REQUEST  = 80
 
-DEFAULT_BATCH_SIZE  = 768
+DEFAULT_BATCH_SIZE  = 4096
 N_LOG_CHECKPOINTS   = 20
-BINOMIAL_CHUNK_SIZE = 200  # binomial pairs processed per extraction pass
+BINOMIAL_CHUNK_SIZE = 594   # process all binomials in one chunk on A100
 SCORE_WORKERS       = max(1, (os.cpu_count() or 1) - 1)
 
 MODEL_CONFIGS = {
@@ -292,6 +291,7 @@ def collect_sentences(
           f"Remaining: {len(remaining)}")
 
     if remaining:
+        from anthropic import Anthropic
         client    = Anthropic()
         pool_lock = threading.Lock()
 

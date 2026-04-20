@@ -227,7 +227,7 @@ def _generate_for_pair(
     phrase_ab: str,
     phrase_ba: str,
     n: int,
-    client: Anthropic,
+    client,
 ) -> Tuple[List[str], List[str]]:
     n_request = min(n + REQUEST_BUFFER, MAX_PER_REQUEST)
     prompt = (

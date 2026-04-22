@@ -454,18 +454,47 @@ def extract_representations(
 
 def _batch_self_similarity(X: torch.Tensor) -> torch.Tensor:
     """
-    X: (N, n, D) → (N,) self-similarity scores.
+    Batched self-similarity: X (N, n, D) → (N,) scores.
 
-    The centred kernel Kc = HKH satisfies sum(Kc) = 0, so
-        mean(off-diagonal) = -sum(diagonal) / (n(n-1))
-    and Kc[i,i] = ||x_i - μ||², so:
-        mean(off-diagonal) = -||X_c||_F² / (n(n-1))
+    WHAT IT MEASURES
+    ----------------
+    Self-similarity asks: across n different sentences that all contain the
+    same phrase, does the model produce consistent representations?  High
+    self-similarity means the representation barely changes with context;
+    low (more negative) means it varies a lot.
 
-    O(nD) instead of O(n²D) — no gram matrix needed.
+    NAIVE APPROACH — O(n²D)
+    -----------------------
+    Build the (n, n) Gram matrix  K = X Xᵀ,  then centre it:
+        Kc = K - col_mean - row_mean + grand_mean   (double-centering)
+    and return the mean of the off-diagonal elements of Kc.
+
+    SHORTCUT — O(nD), no Gram matrix
+    ---------------------------------
+    Two facts about the centred kernel Kc:
+
+    Fact 1 — sum of ALL elements of Kc is zero.
+        Double-centering subtracts every row mean and every column mean, so
+        the total always cancels to 0.
+
+    Fact 2 — the diagonal of Kc equals the squared distance to the mean:
+        Kc[i,i] = ||x_i - μ||²   where μ = (1/n) Σ x_i
+
+        Proof:  Kc[i,i] = K[i,i] - 2·(row mean of row i) + grand mean
+                         = xᵢᵀxᵢ - (2/n)·xᵢᵀ(Σxⱼ) + (1/n²)·||Σxⱼ||²
+                         = ||xᵢ||² - 2xᵢᵀμ + ||μ||²  =  ||xᵢ - μ||²
+
+    Combining Facts 1 and 2:
+        sum(off-diagonal) = -sum(diagonal) = -Σᵢ ||xᵢ - μ||² = -||Xc||_F²
+
+        mean(off-diagonal) = -||Xc||_F² / (n(n-1))
+
+    where Xc = X - μ is the mean-centred data matrix.  This only requires
+    computing centred vectors and their norms — no n×n matrix ever formed.
     """
     _, n, _ = X.shape
-    mu    = X.mean(dim=1, keepdim=True)          # (N, 1, D)
-    X_c   = X - mu                               # (N, n, D) centred
+    mu    = X.mean(dim=1, keepdim=True)          # (N, 1, D)  — per-binomial mean
+    X_c   = X - mu                               # (N, n, D)  — mean-centred reps
     return -X_c.pow(2).sum(dim=(1, 2)) / (n * (n - 1))  # (N,)
 
 
@@ -475,13 +504,75 @@ def compute_scores_batched(
     device: str,
 ) -> Dict[str, List[Dict]]:
     """
-    Compute scores for all (phrase_AB, phrase_BA) pairs at once, batched
-    by layer.  Replaces the per-binomial loop with a single batched GPU
-    call per layer, saturating the GPU and eliminating Python overhead.
+    Compute self-similarity and Procrustes scores for all binomial pairs,
+    batched across all N binomials simultaneously for each layer.
 
-    Procrustes uses the algebraic shortcut
-        ||AR - B||_F^2 = ||A||_F^2 + ||B||_F^2 - 2·sum(svdvals(A^T B))
-    so only singular values are needed (no full SVD, no explicit R).
+    BATCHING STRATEGY
+    -----------------
+    The naive approach loops over each binomial and calls a per-binomial
+    scoring function.  For N=594 binomials × 25 layers that's ~15,000
+    small GPU operations — each with Python and kernel-launch overhead,
+    and none saturating the GPU.
+
+    Instead we process all N binomials at once per layer, stacking their
+    representations into (N, n, D) tensors and using batched operations
+    (torch.bmm, torch.linalg.eigh, torch.linalg.svdvals).  This issues
+    ~25 GPU calls total (one set per layer) and keeps the GPU fully loaded.
+
+    PROCRUSTES RESIDUAL SHORTCUT
+    ----------------------------
+    Orthogonal Procrustes finds the rotation R that best aligns A onto B:
+        R* = argmin_{RᵀR=I}  ||AR - B||_F
+
+    The solution is R* = UVᵀ  from SVD(AᵀB) = USVᵀ.
+
+    The residual at R* can be derived without ever constructing R*:
+
+        ||AR* - B||_F²
+          = ||AR*||_F² - 2·tr(R*ᵀAᵀB) + ||B||_F²
+          = ||A||_F²   - 2·tr(R*ᵀAᵀB) + ||B||_F²    (rotation preserves norm)
+
+    At R* = UVᵀ:
+        tr(R*ᵀAᵀB) = tr(VUᵀ · USVᵀ) = tr(VSVᵀ) = tr(S) = Σᵢ σᵢ(AᵀB)
+
+    So:  ||AR* - B||_F² = ||A||_F² + ||B||_F² - 2·Σᵢ σᵢ(AᵀB)
+
+    We only need the singular values of AᵀB — no need to form R* or
+    compute AR* - B.
+
+    THIN-FACTORISATION SHORTCUT (avoids (N, D, D) matrix)
+    ------------------------------------------------------
+    A has shape (N, n, D) with n=500 « D=2048.  Computing AᵀB directly
+    gives a (N, D, D) tensor (≈10 GB for 1.3B) and requires SVD of
+    2048×2048 matrices — O(D³) per matrix.
+
+    Instead, we factor through A's thin SVD:
+
+        A = U_A · diag(S_A) · V_Aᵀ        (U_A: n×n,  V_A: D×n, V_Aᵀ V_A = I)
+
+    Then:
+        AᵀB = V_A · diag(S_A) · U_Aᵀ · B  =  V_A · C
+                                                       where C = diag(S_A)(U_AᵀB)
+
+    Key lemma: left-multiplying by V_A (which has orthonormal columns)
+    does not change singular values.  Proof via the AB~BA eigenvalue
+    property:
+
+        σᵢ²(V_A C) = eigenvalues of (V_A C)(V_A C)ᵀ = V_A C Cᵀ V_Aᵀ
+        non-zero eigenvalues of V_A (C Cᵀ V_Aᵀ)
+            = non-zero eigenvalues of (C Cᵀ V_Aᵀ) V_A
+            = non-zero eigenvalues of C Cᵀ (V_Aᵀ V_A)
+            = non-zero eigenvalues of C Cᵀ             (since V_Aᵀ V_A = I)
+            = σᵢ²(C)
+
+    So  Σᵢ σᵢ(AᵀB) = Σᵢ σᵢ(C)  where C is (N, n, D) — SVD of n×n matrices
+    instead of D×D, giving O(n²D) instead of O(D³) per layer (~17× faster
+    for 1.3B where D=2048, n=500).
+
+    U_A and S_A are obtained from eigh(AAᵀ) rather than a full SVD:
+        AAᵀ = U_A · diag(S_A²) · U_Aᵀ   (symmetric, so eigh is exact)
+    so  S_A = sqrt(eigenvalues)  and  U_A = eigenvectors.
+    ||A||_F² = tr(AAᵀ) = Σ eigenvalues, so we reuse L_A for norm_A_sq.
 
     Returns {phrase_AB: [score_row_per_layer, ...]}.
     """
@@ -517,6 +608,10 @@ def compute_scores_batched(
         A_arrs = [chunk_reps[ab][layer_idx] for ab, _  in layer_pairs]
         B_arrs = [chunk_reps[ba][layer_idx] for _,  ba in layer_pairs]
         n = min(min(len(a) for a in A_arrs), min(len(b) for b in B_arrs))
+        if n < 2:
+            tqdm.write(f"  ⚠️  layer {layer_idx}: n={n} < 2, skipping layer (need ≥2 sentences for self-similarity)")
+            steps.close()
+            continue
         A = torch.from_numpy(np.stack([a[:n] for a in A_arrs])).to(device).float()
         B = torch.from_numpy(np.stack([b[:n] for b in B_arrs])).to(device).float()
         steps.update(1)
@@ -531,23 +626,32 @@ def compute_scores_batched(
         if device != "cpu": torch.cuda.synchronize()
         steps.update(1)
 
-        # Procrustes via thin factorisation: avoid (N, D, D) SVD.
-        # A = U_A diag(S_A) V_A^T  →  svdvals(A^T B) = svdvals(diag(S_A) U_A^T B)
-        # which is (N, n, D) instead of (N, D, D) — verified numerically correct.
+        # ---- Procrustes ----
+        # Goal: ||AR* - B||_F / ||B||_F  where R* is the optimal rotation.
+        #
+        # Shortcut 1 — residual without forming R*:
+        #   ||AR* - B||_F² = ||A||_F² + ||B||_F² - 2·Σ σᵢ(AᵀB)
+        #
+        # Shortcut 2 — thin factorisation to avoid (N, D, D):
+        #   eigh(AAᵀ) → U_A (left singular vectors), L_A (= S_A²)
+        #   C = diag(S_A) · U_Aᵀ B   is (N, n, D)  instead of (N, D, D)
+        #   Σ σᵢ(AᵀB) = Σ σᵢ(C)  because V_A (orthonormal cols) doesn't
+        #   change singular values.
+        #   Also reuse L_A: ||A||_F² = tr(AAᵀ) = Σ eigenvalues.
         steps.set_description(f"    layer {layer_idx:>2d}  procrustes eigh")
-        AAT       = torch.bmm(A, A.transpose(1, 2))             # (N, n, n)
-        L_A, U_A  = torch.linalg.eigh(AAT)                     # (N, n), (N, n, n)
-        norm_A_sq = L_A.clamp(min=0).sum(dim=1)                # ||A||_F^2
-        norm_B_sq = B.pow(2).sum(dim=(1, 2))
+        AAT       = torch.bmm(A, A.transpose(1, 2))   # (N, n, n) = A Aᵀ
+        L_A, U_A  = torch.linalg.eigh(AAT)            # L_A = S_A², U_A = left singular vecs
+        norm_A_sq = L_A.clamp(min=0).sum(dim=1)       # ||A||_F² = Σ eigenvalues
+        norm_B_sq = B.pow(2).sum(dim=(1, 2))           # ||B||_F²
         if device != "cpu": torch.cuda.synchronize()
         steps.update(1)
 
         steps.set_description(f"    layer {layer_idx:>2d}  procrustes svd")
-        S_A      = L_A.clamp(min=0).sqrt()                     # (N, n)
-        C        = S_A.unsqueeze(-1) * torch.bmm(U_A.transpose(1, 2), B)  # (N, n, D)
-        S        = torch.linalg.svdvals(C)                     # (N, n) — n << D
+        S_A      = L_A.clamp(min=0).sqrt()                              # (N, n) singular values of A
+        C        = S_A.unsqueeze(-1) * torch.bmm(U_A.transpose(1, 2), B)  # (N, n, D): diag(S_A) U_Aᵀ B
+        S        = torch.linalg.svdvals(C)                              # (N, n): σᵢ(AᵀB) via σᵢ(C)
         resid_sq = (norm_A_sq + norm_B_sq - 2.0 * S.sum(dim=1)).clamp(min=0.0)
-        proc     = resid_sq.sqrt() / norm_B_sq.sqrt().clamp(min=1e-10)
+        proc     = resid_sq.sqrt() / norm_B_sq.sqrt().clamp(min=1e-10)  # normalised residual
         if device != "cpu": torch.cuda.synchronize()
         steps.update(1)
 
@@ -561,11 +665,11 @@ def compute_scores_batched(
         for i, (ab, ba) in enumerate(layer_pairs):
             s_ab  = float(ss_ab_np[i])
             s_ba  = float(ss_ba_np[i])
-            ratio = s_ab / s_ba if s_ba and not math.isnan(s_ba) else float("nan")
+            ratio = s_ab / s_ba if (math.isfinite(s_ba) and s_ba != 0.0) else float("nan")
             scores_by_ab[ab].append({
                 "layer":           layer_idx,
-                "n_sentences_AB":  len(A_arrs[i]),
-                "n_sentences_BA":  len(B_arrs[i]),
+                "n_sentences_AB":  n,   # actual n used (batch minimum)
+                "n_sentences_BA":  n,
                 "self_sim_AB":     s_ab,
                 "self_sim_BA":     s_ba,
                 "self_sim_ratio":  ratio,

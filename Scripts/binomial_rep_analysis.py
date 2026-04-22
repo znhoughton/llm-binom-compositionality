@@ -649,7 +649,7 @@ def compute_scores_batched(
         steps.set_description(f"    layer {layer_idx:>2d}  procrustes svd")
         S_A      = L_A.clamp(min=0).sqrt()                              # (N, n) singular values of A
         C        = S_A.unsqueeze(-1) * torch.bmm(U_A.transpose(1, 2), B)  # (N, n, D): diag(S_A) U_Aᵀ B
-        S        = torch.linalg.svdvals(C)                              # (N, n): σᵢ(AᵀB) via σᵢ(C)
+        S        = torch.linalg.svd(C, full_matrices=False, driver='gesvd').S  # (N, n): σᵢ(AᵀB) via σᵢ(C)
         resid_sq = (norm_A_sq + norm_B_sq - 2.0 * S.sum(dim=1)).clamp(min=0.0)
         proc     = resid_sq.sqrt() / norm_B_sq.sqrt().clamp(min=1e-10)  # normalised residual
         if device != "cpu": torch.cuda.synchronize()
@@ -668,8 +668,8 @@ def compute_scores_batched(
             ratio = s_ab / s_ba if (math.isfinite(s_ba) and s_ba != 0.0) else float("nan")
             scores_by_ab[ab].append({
                 "layer":           layer_idx,
-                "n_sentences_AB":  n,   # actual n used (batch minimum)
-                "n_sentences_BA":  n,
+                "n_sentences_AB":  len(A_arrs[i]),
+                "n_sentences_BA":  len(B_arrs[i]),
                 "self_sim_AB":     s_ab,
                 "self_sim_BA":     s_ba,
                 "self_sim_ratio":  ratio,

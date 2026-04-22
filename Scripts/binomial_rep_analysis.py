@@ -518,18 +518,12 @@ def compute_scores_batched(
         ss_ba = _batch_self_similarity(B)
 
         # Procrustes: ||A||_F^2 + ||B||_F^2 - 2·sum(S)  where S = svdvals(A^T B)
-        # Avoid the (N, D, D) matrix: A = U_A diag(S_A) V_A^T, so
-        #   svdvals(A^T B) = svdvals(diag(S_A) @ U_A^T @ B)  [V_A orthogonal]
-        # giving an (N, n, D) matrix instead of (N, D, D).
-        AAT       = torch.bmm(A, A.transpose(1, 2))            # (N, n, n)
-        L_A, U_A  = torch.linalg.eigh(AAT)                    # (N, n), (N, n, n)
-        S_A       = L_A.clamp(min=0).sqrt()                   # (N, n)
-        C         = S_A.unsqueeze(-1) * torch.bmm(U_A.transpose(1, 2), B)  # (N, n, D)
-        S         = torch.linalg.svdvals(C)                    # (N, n)
-        norm_A_sq = L_A.clamp(min=0).sum(dim=1)               # (N,)  reuse eigenvalues
-        norm_B_sq = B.pow(2).sum(dim=(1, 2))                  # (N,)
-        resid_sq  = (norm_A_sq + norm_B_sq - 2.0 * S.sum(dim=1)).clamp(min=0.0)
-        proc      = resid_sq.sqrt() / norm_B_sq.sqrt().clamp(min=1e-10)  # (N,)
+        M          = torch.bmm(A.transpose(1, 2), B)          # (N, D, D)
+        S          = torch.linalg.svdvals(M)                   # (N, D)
+        norm_A_sq  = A.pow(2).sum(dim=(1, 2))                  # (N,)
+        norm_B_sq  = B.pow(2).sum(dim=(1, 2))                  # (N,)
+        resid_sq   = (norm_A_sq + norm_B_sq - 2.0 * S.sum(dim=1)).clamp(min=0.0)
+        proc       = resid_sq.sqrt() / norm_B_sq.sqrt().clamp(min=1e-10)  # (N,)
 
         ss_ab_np = ss_ab.cpu().numpy()
         ss_ba_np = ss_ba.cpu().numpy()

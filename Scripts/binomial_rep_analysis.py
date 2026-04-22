@@ -497,7 +497,7 @@ def compute_scores_batched(
 
     scores_by_ab: Dict[str, List[Dict]] = {ab: [] for ab, _ in valid_pairs}
 
-    for layer_idx in tqdm(all_layers, desc="  Layers"):
+    for layer_idx in tqdm(all_layers, desc="  Layers", position=0):
         layer_pairs = [
             (ab, ba) for ab, ba in valid_pairs
             if layer_idx in chunk_reps[ab] and layer_idx in chunk_reps[ba]
@@ -505,29 +505,52 @@ def compute_scores_batched(
         if not layer_pairs:
             continue
 
+        steps = tqdm(
+            ["stack", "self-sim AB", "self-sim BA", "procrustes bmm",
+             "procrustes svd", "collect"],
+            desc=f"    layer {layer_idx:>2d}",
+            leave=False,
+            position=1,
+        )
+
+        steps.set_description(f"    layer {layer_idx:>2d}  stack")
         A_arrs = [chunk_reps[ab][layer_idx] for ab, _  in layer_pairs]
         B_arrs = [chunk_reps[ba][layer_idx] for _,  ba in layer_pairs]
-        # Truncate to a common sentence count so we can stack into one tensor.
         n = min(min(len(a) for a in A_arrs), min(len(b) for b in B_arrs))
-
         A = torch.from_numpy(np.stack([a[:n] for a in A_arrs])).to(device).float()
         B = torch.from_numpy(np.stack([b[:n] for b in B_arrs])).to(device).float()
+        steps.update(1)
 
-        # Self-similarity: batched (N, n, D) → (N,)
+        steps.set_description(f"    layer {layer_idx:>2d}  self-sim AB")
         ss_ab = _batch_self_similarity(A)
+        if device != "cpu": torch.cuda.synchronize()
+        steps.update(1)
+
+        steps.set_description(f"    layer {layer_idx:>2d}  self-sim BA")
         ss_ba = _batch_self_similarity(B)
+        if device != "cpu": torch.cuda.synchronize()
+        steps.update(1)
 
-        # Procrustes: ||A||_F^2 + ||B||_F^2 - 2·sum(S)  where S = svdvals(A^T B)
-        M          = torch.bmm(A.transpose(1, 2), B)          # (N, D, D)
-        S          = torch.linalg.svdvals(M)                   # (N, D)
-        norm_A_sq  = A.pow(2).sum(dim=(1, 2))                  # (N,)
-        norm_B_sq  = B.pow(2).sum(dim=(1, 2))                  # (N,)
-        resid_sq   = (norm_A_sq + norm_B_sq - 2.0 * S.sum(dim=1)).clamp(min=0.0)
-        proc       = resid_sq.sqrt() / norm_B_sq.sqrt().clamp(min=1e-10)  # (N,)
+        steps.set_description(f"    layer {layer_idx:>2d}  procrustes bmm")
+        M         = torch.bmm(A.transpose(1, 2), B)
+        norm_A_sq = A.pow(2).sum(dim=(1, 2))
+        norm_B_sq = B.pow(2).sum(dim=(1, 2))
+        if device != "cpu": torch.cuda.synchronize()
+        steps.update(1)
 
+        steps.set_description(f"    layer {layer_idx:>2d}  procrustes svd")
+        S        = torch.linalg.svdvals(M)
+        resid_sq = (norm_A_sq + norm_B_sq - 2.0 * S.sum(dim=1)).clamp(min=0.0)
+        proc     = resid_sq.sqrt() / norm_B_sq.sqrt().clamp(min=1e-10)
+        if device != "cpu": torch.cuda.synchronize()
+        steps.update(1)
+
+        steps.set_description(f"    layer {layer_idx:>2d}  collect")
         ss_ab_np = ss_ab.cpu().numpy()
         ss_ba_np = ss_ba.cpu().numpy()
         proc_np  = proc.cpu().numpy()
+        steps.update(1)
+        steps.close()
 
         for i, (ab, ba) in enumerate(layer_pairs):
             s_ab  = float(ss_ab_np[i])

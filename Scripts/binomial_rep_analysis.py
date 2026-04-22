@@ -506,7 +506,7 @@ def compute_scores_batched(
             continue
 
         steps = tqdm(
-            ["stack", "self-sim AB", "self-sim BA", "procrustes bmm",
+            ["stack", "self-sim AB", "self-sim BA", "procrustes eigh",
              "procrustes svd", "collect"],
             desc=f"    layer {layer_idx:>2d}",
             leave=False,
@@ -531,15 +531,21 @@ def compute_scores_batched(
         if device != "cpu": torch.cuda.synchronize()
         steps.update(1)
 
-        steps.set_description(f"    layer {layer_idx:>2d}  procrustes bmm")
-        M         = torch.bmm(A.transpose(1, 2), B)
-        norm_A_sq = A.pow(2).sum(dim=(1, 2))
+        # Procrustes via thin factorisation: avoid (N, D, D) SVD.
+        # A = U_A diag(S_A) V_A^T  →  svdvals(A^T B) = svdvals(diag(S_A) U_A^T B)
+        # which is (N, n, D) instead of (N, D, D) — verified numerically correct.
+        steps.set_description(f"    layer {layer_idx:>2d}  procrustes eigh")
+        AAT       = torch.bmm(A, A.transpose(1, 2))             # (N, n, n)
+        L_A, U_A  = torch.linalg.eigh(AAT)                     # (N, n), (N, n, n)
+        norm_A_sq = L_A.clamp(min=0).sum(dim=1)                # ||A||_F^2
         norm_B_sq = B.pow(2).sum(dim=(1, 2))
         if device != "cpu": torch.cuda.synchronize()
         steps.update(1)
 
         steps.set_description(f"    layer {layer_idx:>2d}  procrustes svd")
-        S        = torch.linalg.svdvals(M)
+        S_A      = L_A.clamp(min=0).sqrt()                     # (N, n)
+        C        = S_A.unsqueeze(-1) * torch.bmm(U_A.transpose(1, 2), B)  # (N, n, D)
+        S        = torch.linalg.svdvals(C)                     # (N, n) — n << D
         resid_sq = (norm_A_sq + norm_B_sq - 2.0 * S.sum(dim=1)).clamp(min=0.0)
         proc     = resid_sq.sqrt() / norm_B_sq.sqrt().clamp(min=1e-10)
         if device != "cpu": torch.cuda.synchronize()

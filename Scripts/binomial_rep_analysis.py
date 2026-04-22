@@ -75,26 +75,32 @@ RETRY_WAIT       = 10
 REQUEST_BUFFER   = 20
 MAX_PER_REQUEST  = 80
 
-DEFAULT_BATCH_SIZE  = 4096
+DEFAULT_BATCH_SIZE  = 512
 N_LOG_CHECKPOINTS   = 20
 BINOMIAL_CHUNK_SIZE = 594   # process all binomials in one chunk on A100
-SCORE_WORKERS       = max(1, (os.cpu_count() or 1) - 1)
 
+# Actual padded seq_len is driven by the batch's longest sentence (~40–60 tokens
+# for these short phrases), not max_length=512, so memory is far lower than the
+# worst-case estimate.  The OOM fallback will halve automatically if a batch of
+# unusually long sentences causes an issue.
 MODEL_CONFIGS = {
     "znhoughton/opt-babylm-125m-20eps-seed964": {
         "tokens_per_step": 1_638_400,
         "tokenizer":       "znhoughton/opt-babylm-125m-20eps-seed964",
         "size_label":      "125m",
+        "batch_size":      4096,
     },
     "znhoughton/opt-babylm-350m-20eps-seed964": {
         "tokens_per_step": 819_200,
         "tokenizer":       "znhoughton/opt-babylm-350m-20eps-seed964",
         "size_label":      "350m",
+        "batch_size":      4096,
     },
     "znhoughton/opt-babylm-1.3b-20eps-seed964": {
         "tokens_per_step": 1_024_000,
         "tokenizer":       "znhoughton/opt-babylm-1.3b-20eps-seed964",
         "size_label":      "1.3b",
+        "batch_size":      2048,  # start high; OOM fallback will halve if needed
     },
 }
 
@@ -354,13 +360,16 @@ def extract_representations(
     batch_size: int = DEFAULT_BATCH_SIZE,
 ) -> Dict[str, Dict[int, np.ndarray]]:
     """
-    Forward-pass all sentences across all phrases in shared batches, then
-    unpack results per phrase. Halves forward passes vs per-phrase batching.
+    Forward-pass all sentences in shared batches.  For each batch:
+      1. Compute token-span masks on CPU (from offset mappings).
+      2. Run one vectorised masked-mean on GPU per layer.
+      3. Transfer all valid pooled vectors in a single .cpu() call per layer.
+
+    This replaces O(B * n_layers) small GPU→CPU transfers with O(n_layers).
 
     Returns:
         { phrase: { layer_idx: np.ndarray (n_sentences, hidden_dim) } }
     """
-    # Flatten to (phrase, sentence) pairs
     pairs: List[Tuple[str, str]] = [
         (phrase, sentence)
         for phrase, sentences in phrase_sentence_map.items()
@@ -387,22 +396,41 @@ def extract_representations(
                     return_offsets_mapping=True,
                 )
                 offset_mappings = enc.pop("offset_mapping").tolist()
+                seq_len = enc["input_ids"].shape[1]
                 enc = enc.to(device)
 
                 outputs       = model(**enc, output_hidden_states=True)
-                hidden_states = outputs.hidden_states  # (n_layers+1, B, T, D)
+                hidden_states = outputs.hidden_states  # tuple of (B, T, D)
 
+                # Build span mask (B, T) on CPU; track which sentences are valid.
+                B = len(batch_pairs)
+                span_mask = torch.zeros(B, seq_len, dtype=torch.bool)
+                valid_map: List[Tuple[int, str]] = []
                 for b_idx, (phrase, sentence) in enumerate(batch_pairs):
                     span = find_phrase_span_in_tokens(
                         phrase, sentence, offset_mappings[b_idx]
                     )
-                    if span is None:
-                        continue
-                    start, end = span
+                    if span is not None:
+                        span_mask[b_idx, span[0]:span[1] + 1] = True
+                        valid_map.append((b_idx, phrase))
+
+                if valid_map:
+                    span_mask_dev = span_mask.to(device)
+                    valid_bidx = [b for b, _ in valid_map]
+
                     for layer_idx, layer_h in enumerate(hidden_states):
-                        pooled = layer_h[b_idx, start:end + 1, :] \
-                                     .mean(dim=0).cpu().float().numpy()
-                        layer_accum[phrase].setdefault(layer_idx, []).append(pooled)
+                        # Vectorised masked mean — stays on GPU in model dtype.
+                        dtype = layer_h.dtype
+                        span_f = span_mask_dev.to(dtype).unsqueeze(-1)  # (B, T, 1)
+                        counts = span_f.squeeze(-1).sum(dim=1, keepdim=True).clamp(min=1.0)
+                        pooled = (layer_h * span_f).sum(dim=1) / counts  # (B, D)
+
+                        # ONE transfer per layer: select valid rows, cast to fp32.
+                        pooled_np = pooled[valid_bidx].float().cpu().numpy()
+                        for vi, (_, phrase) in enumerate(valid_map):
+                            layer_accum[phrase].setdefault(layer_idx, []).append(pooled_np[vi])
+
+                    del span_mask_dev
 
                 pbar.update(len(batch_pairs))
                 i += current_bs
@@ -425,58 +453,76 @@ def extract_representations(
 # SCORES
 # ---------------------------------------------------------------------------
 
-def centred_kernel(X: np.ndarray) -> np.ndarray:
-    K        = X @ X.T
-    col_mean = K.mean(axis=0, keepdims=True)
-    row_mean = K.mean(axis=1, keepdims=True)
-    return K - col_mean - row_mean + K.mean()
-
-
-def self_similarity(X: np.ndarray) -> float:
-    """Mean off-diagonal of the centred kernel matrix."""
-    if len(X) < 2:
-        return float("nan")
-    K    = centred_kernel(X)
-    mask = ~np.eye(len(X), dtype=bool)
-    return float(K[mask].mean())
-
-
-def procrustes_distance(A: np.ndarray, B: np.ndarray) -> float:
-    """
-    Normalised orthogonal Procrustes residual (no scaling).
-    ||AR - B||_F / ||B||_F
-    Rows are subsampled to min(len(A), len(B)) before computation.
-    """
-    n = min(len(A), len(B))
+def _self_similarity_gpu(X: torch.Tensor) -> float:
+    n = X.shape[0]
     if n < 2:
         return float("nan")
-    A, B   = A[:n], B[:n]
-    R, _   = orthogonal_procrustes(A, B)
-    resid  = np.linalg.norm(A @ R - B, "fro")
-    norm_b = np.linalg.norm(B, "fro")
-    return float(resid / norm_b) if norm_b > 0 else float("nan")
+    K        = X @ X.T
+    col_mean = K.mean(dim=0, keepdim=True)
+    row_mean = K.mean(dim=1, keepdim=True)
+    Kc       = K - col_mean - row_mean + K.mean()
+    mask     = ~torch.eye(n, dtype=torch.bool, device=X.device)
+    return float(Kc[mask].mean().item())
+
+
+def _procrustes_distance_gpu(A: torch.Tensor, B: torch.Tensor) -> float:
+    """||AR - B||_F / ||B||_F  where R = argmin orthogonal Procrustes."""
+    n = min(A.shape[0], B.shape[0])
+    if n < 2:
+        return float("nan")
+    A, B   = A[:n].float(), B[:n].float()
+    U, _, Vh = torch.linalg.svd(A.T @ B, full_matrices=False)
+    R      = U @ Vh
+    resid  = torch.linalg.matrix_norm(A @ R - B, ord="fro")
+    norm_b = torch.linalg.matrix_norm(B, ord="fro")
+    return float((resid / norm_b).item()) if norm_b.item() > 1e-10 else float("nan")
 
 
 def compute_scores(
     reps_ab: Dict[int, np.ndarray],
     reps_ba: Dict[int, np.ndarray],
+    device: str = "cpu",
 ) -> List[Dict]:
     rows = []
+    use_gpu = device != "cpu" and torch.cuda.is_available()
     for layer_idx in sorted(set(reps_ab) & set(reps_ba)):
-        A     = reps_ab[layer_idx]
-        B     = reps_ba[layer_idx]
-        ss_ab = self_similarity(A)
-        ss_ba = self_similarity(B)
-        ratio = (ss_ab / ss_ba
-                 if ss_ba and not math.isnan(ss_ba) else float("nan"))
+        A_np = reps_ab[layer_idx]
+        B_np = reps_ba[layer_idx]
+        if use_gpu:
+            A     = torch.from_numpy(A_np).to(device)
+            B     = torch.from_numpy(B_np).to(device)
+            ss_ab = _self_similarity_gpu(A)
+            ss_ba = _self_similarity_gpu(B)
+            ratio = (ss_ab / ss_ba
+                     if ss_ba and not math.isnan(ss_ba) else float("nan"))
+            proc  = _procrustes_distance_gpu(A, B)
+        else:
+            K_a   = A_np @ A_np.T
+            K_a  -= K_a.mean(axis=0) + K_a.mean(axis=1, keepdims=True) - K_a.mean()
+            K_b   = B_np @ B_np.T
+            K_b  -= K_b.mean(axis=0) + K_b.mean(axis=1, keepdims=True) - K_b.mean()
+            mask  = ~np.eye(len(A_np), dtype=bool)
+            ss_ab = float(K_a[mask].mean()) if len(A_np) >= 2 else float("nan")
+            mask  = ~np.eye(len(B_np), dtype=bool)
+            ss_ba = float(K_b[mask].mean()) if len(B_np) >= 2 else float("nan")
+            ratio = (ss_ab / ss_ba
+                     if ss_ba and not math.isnan(ss_ba) else float("nan"))
+            n     = min(len(A_np), len(B_np))
+            if n >= 2:
+                R, _  = orthogonal_procrustes(A_np[:n], B_np[:n])
+                resid = np.linalg.norm(A_np[:n] @ R - B_np[:n], "fro")
+                norm_b = np.linalg.norm(B_np[:n], "fro")
+                proc  = float(resid / norm_b) if norm_b > 0 else float("nan")
+            else:
+                proc = float("nan")
         rows.append({
             "layer":           layer_idx,
-            "n_sentences_AB":  len(A),
-            "n_sentences_BA":  len(B),
+            "n_sentences_AB":  len(A_np),
+            "n_sentences_BA":  len(B_np),
             "self_sim_AB":     ss_ab,
             "self_sim_BA":     ss_ba,
             "self_sim_ratio":  ratio,
-            "procrustes_dist": procrustes_distance(A, B),
+            "procrustes_dist": proc,
         })
     return rows
 
@@ -621,48 +667,37 @@ def main():
 
                         print(f"  Extracting chunk {chunk_idx+1}/{n_chunks} ...")
                         chunk_reps = extract_representations(
-                            model, tokenizer, chunk_map, device
+                            model, tokenizer, chunk_map, device,
+                            batch_size=config.get("batch_size", DEFAULT_BATCH_SIZE),
                         )
 
                         print(f"  Computing scores ...")
-
-                        def _score_row(row):
+                        rows_iter = [r for _, r in chunk_df.iterrows()]
+                        for row in tqdm(rows_iter, desc="  Binomials", leave=True):
                             ab, ba = row["phrase_AB"], row["phrase_BA"]
                             reps_ab = chunk_reps.get(ab, {})
                             reps_ba = chunk_reps.get(ba, {})
                             if not reps_ab or not reps_ba:
-                                return row, None
-                            return row, compute_scores(reps_ab, reps_ba)
-
-                        rows_iter = [r for _, r in chunk_df.iterrows()]
-                        with ThreadPoolExecutor(max_workers=SCORE_WORKERS) as score_pool:
-                            futures = {score_pool.submit(_score_row, r): r
-                                       for r in rows_iter}
-                            for fut in tqdm(as_completed(futures),
-                                            total=len(futures),
-                                            desc="  Binomials", leave=True):
-                                row, scores = fut.result()
-                                if scores is None:
-                                    print(f"    ⚠️  No reps for ({row['Word1']}, "
-                                          f"{row['Word2']}), skipping.")
-                                    continue
-                                ab, ba = row["phrase_AB"], row["phrase_BA"]
-                                completed.add((model_name, ckpt["checkpoint"], ab))
-                                for score_row in scores:
-                                    writer.writerow({
-                                        "model":        model_name,
-                                        "model_size":   size_label,
-                                        "checkpoint":   ckpt["checkpoint"],
-                                        "step":         ckpt["step"],
-                                        "tokens":       ckpt["tokens"],
-                                        "word1":        row["Word1"],
-                                        "word2":        row["Word2"],
-                                        "phrase_AB":    ab,
-                                        "phrase_BA":    ba,
-                                        "overall_freq": row.get("OverallFreq", ""),
-                                        "rel_freq":     row.get("RelFreq", ""),
-                                        **score_row,
-                                    })
+                                print(f"    ⚠️  No reps for ({row['Word1']}, "
+                                      f"{row['Word2']}), skipping.")
+                                continue
+                            scores = compute_scores(reps_ab, reps_ba, device=device)
+                            completed.add((model_name, ckpt["checkpoint"], ab))
+                            for score_row in scores:
+                                writer.writerow({
+                                    "model":        model_name,
+                                    "model_size":   size_label,
+                                    "checkpoint":   ckpt["checkpoint"],
+                                    "step":         ckpt["step"],
+                                    "tokens":       ckpt["tokens"],
+                                    "word1":        row["Word1"],
+                                    "word2":        row["Word2"],
+                                    "phrase_AB":    ab,
+                                    "phrase_BA":    ba,
+                                    "overall_freq": row.get("OverallFreq", ""),
+                                    "rel_freq":     row.get("RelFreq", ""),
+                                    **score_row,
+                                })
 
                         del chunk_reps
                         out_file.flush()

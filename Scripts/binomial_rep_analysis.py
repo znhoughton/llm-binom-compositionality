@@ -542,14 +542,30 @@ FIELDNAMES = [
 
 
 def load_completed(out_csv: str) -> set:
-    """Returns set of (model, checkpoint, phrase_AB) already written."""
-    completed = set()
+    """
+    Returns set of (model, checkpoint, phrase_AB) that have a full layer set.
+    Infers the expected layer count from the most common count in the CSV;
+    any entry with fewer rows is treated as incomplete and will be re-run.
+    """
     if not Path(out_csv).exists():
-        return completed
+        return set()
+
+    from collections import Counter
+    layer_counts: Dict[tuple, int] = {}
     with open(out_csv, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
-            completed.add((row["model"], row["checkpoint"], row["phrase_AB"]))
-    return completed
+            key = (row["model"], row["checkpoint"], row["phrase_AB"])
+            layer_counts[key] = layer_counts.get(key, 0) + 1
+
+    if not layer_counts:
+        return set()
+
+    expected = Counter(layer_counts.values()).most_common(1)[0][0]
+    incomplete = [k for k, v in layer_counts.items() if v < expected]
+    if incomplete:
+        print(f"  ⚠️  {len(incomplete)} incomplete entries (< {expected} layers) "
+              f"will be re-run.")
+    return {k for k, v in layer_counts.items() if v == expected}
 
 
 def open_results_file(out_csv: str):

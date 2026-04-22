@@ -42,7 +42,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import pandas as pd
 import torch
-from scipy.linalg import orthogonal_procrustes
 from tqdm import tqdm
 from huggingface_hub import HfApi
 from transformers import AutoTokenizer, AutoModel
@@ -453,78 +452,96 @@ def extract_representations(
 # SCORES
 # ---------------------------------------------------------------------------
 
-def _self_similarity_gpu(X: torch.Tensor) -> float:
-    n = X.shape[0]
-    if n < 2:
-        return float("nan")
-    K        = X @ X.T
-    col_mean = K.mean(dim=0, keepdim=True)
-    row_mean = K.mean(dim=1, keepdim=True)
-    Kc       = K - col_mean - row_mean + K.mean()
-    mask     = ~torch.eye(n, dtype=torch.bool, device=X.device)
-    return float(Kc[mask].mean().item())
+def _batch_self_similarity(X: torch.Tensor) -> torch.Tensor:
+    """
+    X: (N, n, D) — N binomials, n sentences each, D-dim representations.
+    Returns (N,) self-similarity scores.
+    """
+    N, n, _ = X.shape
+    K          = torch.bmm(X, X.transpose(1, 2))            # (N, n, n)
+    col_mean   = K.mean(dim=1, keepdim=True)                 # (N, 1, n)
+    row_mean   = K.mean(dim=2, keepdim=True)                 # (N, n, 1)
+    grand_mean = K.mean(dim=(1, 2), keepdim=True)            # (N, 1, 1)
+    Kc         = K - col_mean - row_mean + grand_mean        # (N, n, n)
+    off_diag   = ~torch.eye(n, dtype=torch.bool, device=X.device)  # (n, n)
+    return Kc.reshape(N, n * n)[:, off_diag.reshape(n * n)].mean(dim=1)
 
 
-def _procrustes_distance_gpu(A: torch.Tensor, B: torch.Tensor) -> float:
-    """||AR - B||_F / ||B||_F  where R = argmin orthogonal Procrustes."""
-    n = min(A.shape[0], B.shape[0])
-    if n < 2:
-        return float("nan")
-    A, B   = A[:n].float(), B[:n].float()
-    U, _, Vh = torch.linalg.svd(A.T @ B, full_matrices=False)
-    R      = U @ Vh
-    resid  = torch.linalg.matrix_norm(A @ R - B, ord="fro")
-    norm_b = torch.linalg.matrix_norm(B, ord="fro")
-    return float((resid / norm_b).item()) if norm_b.item() > 1e-10 else float("nan")
+def compute_scores_batched(
+    chunk_reps: Dict[str, Dict[int, np.ndarray]],
+    pairs: List[Tuple[str, str]],
+    device: str,
+) -> Dict[str, List[Dict]]:
+    """
+    Compute scores for all (phrase_AB, phrase_BA) pairs at once, batched
+    by layer.  Replaces the per-binomial loop with a single batched GPU
+    call per layer, saturating the GPU and eliminating Python overhead.
 
+    Procrustes uses the algebraic shortcut
+        ||AR - B||_F^2 = ||A||_F^2 + ||B||_F^2 - 2·sum(svdvals(A^T B))
+    so only singular values are needed (no full SVD, no explicit R).
 
-def compute_scores(
-    reps_ab: Dict[int, np.ndarray],
-    reps_ba: Dict[int, np.ndarray],
-    device: str = "cpu",
-) -> List[Dict]:
-    rows = []
-    use_gpu = device != "cpu" and torch.cuda.is_available()
-    for layer_idx in sorted(set(reps_ab) & set(reps_ba)):
-        A_np = reps_ab[layer_idx]
-        B_np = reps_ba[layer_idx]
-        if use_gpu:
-            A     = torch.from_numpy(A_np).to(device)
-            B     = torch.from_numpy(B_np).to(device)
-            ss_ab = _self_similarity_gpu(A)
-            ss_ba = _self_similarity_gpu(B)
-            ratio = (ss_ab / ss_ba
-                     if ss_ba and not math.isnan(ss_ba) else float("nan"))
-            proc  = _procrustes_distance_gpu(A, B)
-        else:
-            K_a   = A_np @ A_np.T
-            K_a  -= K_a.mean(axis=0) + K_a.mean(axis=1, keepdims=True) - K_a.mean()
-            K_b   = B_np @ B_np.T
-            K_b  -= K_b.mean(axis=0) + K_b.mean(axis=1, keepdims=True) - K_b.mean()
-            mask  = ~np.eye(len(A_np), dtype=bool)
-            ss_ab = float(K_a[mask].mean()) if len(A_np) >= 2 else float("nan")
-            mask  = ~np.eye(len(B_np), dtype=bool)
-            ss_ba = float(K_b[mask].mean()) if len(B_np) >= 2 else float("nan")
-            ratio = (ss_ab / ss_ba
-                     if ss_ba and not math.isnan(ss_ba) else float("nan"))
-            n     = min(len(A_np), len(B_np))
-            if n >= 2:
-                R, _  = orthogonal_procrustes(A_np[:n], B_np[:n])
-                resid = np.linalg.norm(A_np[:n] @ R - B_np[:n], "fro")
-                norm_b = np.linalg.norm(B_np[:n], "fro")
-                proc  = float(resid / norm_b) if norm_b > 0 else float("nan")
-            else:
-                proc = float("nan")
-        rows.append({
-            "layer":           layer_idx,
-            "n_sentences_AB":  len(A_np),
-            "n_sentences_BA":  len(B_np),
-            "self_sim_AB":     ss_ab,
-            "self_sim_BA":     ss_ba,
-            "self_sim_ratio":  ratio,
-            "procrustes_dist": proc,
-        })
-    return rows
+    Returns {phrase_AB: [score_row_per_layer, ...]}.
+    """
+    valid_pairs = [
+        (ab, ba) for ab, ba in pairs
+        if chunk_reps.get(ab) and chunk_reps.get(ba)
+    ]
+    all_layers = sorted({
+        layer
+        for ab, ba in valid_pairs
+        for layer in set(chunk_reps[ab]) & set(chunk_reps[ba])
+    })
+
+    scores_by_ab: Dict[str, List[Dict]] = {ab: [] for ab, _ in valid_pairs}
+
+    for layer_idx in tqdm(all_layers, desc="  Layers"):
+        layer_pairs = [
+            (ab, ba) for ab, ba in valid_pairs
+            if layer_idx in chunk_reps[ab] and layer_idx in chunk_reps[ba]
+        ]
+        if not layer_pairs:
+            continue
+
+        A_arrs = [chunk_reps[ab][layer_idx] for ab, _  in layer_pairs]
+        B_arrs = [chunk_reps[ba][layer_idx] for _,  ba in layer_pairs]
+        # Truncate to a common sentence count so we can stack into one tensor.
+        n = min(min(len(a) for a in A_arrs), min(len(b) for b in B_arrs))
+
+        A = torch.from_numpy(np.stack([a[:n] for a in A_arrs])).to(device).float()
+        B = torch.from_numpy(np.stack([b[:n] for b in B_arrs])).to(device).float()
+
+        # Self-similarity: batched (N, n, D) → (N,)
+        ss_ab = _batch_self_similarity(A)
+        ss_ba = _batch_self_similarity(B)
+
+        # Procrustes: ||A||_F^2 + ||B||_F^2 - 2·sum(S)  where S = svdvals(A^T B)
+        M          = torch.bmm(A.transpose(1, 2), B)          # (N, D, D)
+        S          = torch.linalg.svdvals(M)                   # (N, D)
+        norm_A_sq  = A.pow(2).sum(dim=(1, 2))                  # (N,)
+        norm_B_sq  = B.pow(2).sum(dim=(1, 2))                  # (N,)
+        resid_sq   = (norm_A_sq + norm_B_sq - 2.0 * S.sum(dim=1)).clamp(min=0.0)
+        proc       = resid_sq.sqrt() / norm_B_sq.sqrt().clamp(min=1e-10)  # (N,)
+
+        ss_ab_np = ss_ab.cpu().numpy()
+        ss_ba_np = ss_ba.cpu().numpy()
+        proc_np  = proc.cpu().numpy()
+
+        for i, (ab, ba) in enumerate(layer_pairs):
+            s_ab  = float(ss_ab_np[i])
+            s_ba  = float(ss_ba_np[i])
+            ratio = s_ab / s_ba if s_ba and not math.isnan(s_ba) else float("nan")
+            scores_by_ab[ab].append({
+                "layer":           layer_idx,
+                "n_sentences_AB":  len(A_arrs[i]),
+                "n_sentences_BA":  len(B_arrs[i]),
+                "self_sim_AB":     s_ab,
+                "self_sim_BA":     s_ba,
+                "self_sim_ratio":  ratio,
+                "procrustes_dist": float(proc_np[i]),
+            })
+
+    return scores_by_ab
 
 # ---------------------------------------------------------------------------
 # OUTPUT HELPERS
@@ -688,16 +705,18 @@ def main():
                         )
 
                         print(f"  Computing scores ...")
-                        rows_iter = [r for _, r in chunk_df.iterrows()]
-                        for row in tqdm(rows_iter, desc="  Binomials", leave=True):
+                        chunk_pairs = [(r["phrase_AB"], r["phrase_BA"])
+                                       for _, r in chunk_df.iterrows()]
+                        all_scores = compute_scores_batched(
+                            chunk_reps, chunk_pairs, device)
+
+                        for _, row in chunk_df.iterrows():
                             ab, ba = row["phrase_AB"], row["phrase_BA"]
-                            reps_ab = chunk_reps.get(ab, {})
-                            reps_ba = chunk_reps.get(ba, {})
-                            if not reps_ab or not reps_ba:
+                            scores = all_scores.get(ab)
+                            if not scores:
                                 print(f"    ⚠️  No reps for ({row['Word1']}, "
                                       f"{row['Word2']}), skipping.")
                                 continue
-                            scores = compute_scores(reps_ab, reps_ba, device=device)
                             completed.add((model_name, ckpt["checkpoint"], ab))
                             for score_row in scores:
                                 writer.writerow({

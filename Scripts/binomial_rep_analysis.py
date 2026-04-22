@@ -797,13 +797,10 @@ def main():
                 tmp_cache = tempfile.mkdtemp(prefix="hf_ckpt_")
                 try:
                     device = "cuda" if torch.cuda.is_available() else "cpu"
-                    dtype  = (torch.float16 if device == "cuda"
-                              else torch.float32)
 
                     load_kw = dict(
                         low_cpu_mem_usage=True,
                         cache_dir=tmp_cache,
-                        torch_dtype=dtype,
                     )
                     if ckpt["tag"]:
                         load_kw["revision"] = ckpt["tag"]

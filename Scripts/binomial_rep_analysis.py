@@ -454,17 +454,19 @@ def extract_representations(
 
 def _batch_self_similarity(X: torch.Tensor) -> torch.Tensor:
     """
-    X: (N, n, D) — N binomials, n sentences each, D-dim representations.
-    Returns (N,) self-similarity scores.
+    X: (N, n, D) → (N,) self-similarity scores.
+
+    The centred kernel Kc = HKH satisfies sum(Kc) = 0, so
+        mean(off-diagonal) = -sum(diagonal) / (n(n-1))
+    and Kc[i,i] = ||x_i - μ||², so:
+        mean(off-diagonal) = -||X_c||_F² / (n(n-1))
+
+    O(nD) instead of O(n²D) — no gram matrix needed.
     """
-    N, n, _ = X.shape
-    K          = torch.bmm(X, X.transpose(1, 2))            # (N, n, n)
-    col_mean   = K.mean(dim=1, keepdim=True)                 # (N, 1, n)
-    row_mean   = K.mean(dim=2, keepdim=True)                 # (N, n, 1)
-    grand_mean = K.mean(dim=(1, 2), keepdim=True)            # (N, 1, 1)
-    Kc         = K - col_mean - row_mean + grand_mean        # (N, n, n)
-    off_diag   = ~torch.eye(n, dtype=torch.bool, device=X.device)  # (n, n)
-    return Kc.reshape(N, n * n)[:, off_diag.reshape(n * n)].mean(dim=1)
+    _, n, _ = X.shape
+    mu    = X.mean(dim=1, keepdim=True)          # (N, 1, D)
+    X_c   = X - mu                               # (N, n, D) centred
+    return -X_c.pow(2).sum(dim=(1, 2)) / (n * (n - 1))  # (N,)
 
 
 def compute_scores_batched(

@@ -516,7 +516,7 @@ def compute_scores_batched(
 
     Instead we process all N binomials at once per layer, stacking their
     representations into (N, n, D) tensors and using batched operations
-    (torch.bmm, torch.linalg.eigh, torch.linalg.svdvals).  This issues
+    (torch.bmm, torch.linalg.eigh, torch.linalg.svd).  This issues
     ~25 GPU calls total (one set per layer) and keeps the GPU fully loaded.
 
     PROCRUSTES RESIDUAL SHORTCUT
@@ -803,7 +803,7 @@ def main():
                     load_kw = dict(
                         low_cpu_mem_usage=True,
                         cache_dir=tmp_cache,
-                        dtype=dtype,
+                        torch_dtype=dtype,
                     )
                     if ckpt["tag"]:
                         load_kw["revision"] = ckpt["tag"]

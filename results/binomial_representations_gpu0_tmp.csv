@@ -1,0 +1,1 @@
+model,model_size,checkpoint,step,tokens,word1,word2,phrase_AB,phrase_BA,overall_freq,rel_freq,layer,n_sentences_AB,n_sentences_BA,self_sim_AB,self_sim_BA,self_sim_ratio,procrustes_dist

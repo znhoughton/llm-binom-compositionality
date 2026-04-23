@@ -32,10 +32,8 @@ import json
 import os
 import csv
 import math
-import shutil
 import subprocess
 import sys
-import tempfile
 import warnings
 from itertools import groupby
 from pathlib import Path
@@ -792,10 +790,9 @@ def _process_checkpoint(
     print(f"\n  Checkpoint: {ckpt['checkpoint']}  "
           f"(step={ckpt['step']}, tokens={ckpt['tokens']:,})")
 
-    tmp_cache = tempfile.mkdtemp(prefix="hf_ckpt_")
     model = None
     try:
-        load_kw = dict(low_cpu_mem_usage=True, cache_dir=tmp_cache)
+        load_kw = dict(low_cpu_mem_usage=True)
         if ckpt["tag"]:
             load_kw["revision"] = ckpt["tag"]
 
@@ -862,7 +859,6 @@ def _process_checkpoint(
         if model is not None:
             del model
         torch.cuda.empty_cache()
-        shutil.rmtree(tmp_cache, ignore_errors=True)
 
 
 def _load_tokenizer(config: Dict):

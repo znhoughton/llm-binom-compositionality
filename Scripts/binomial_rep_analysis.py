@@ -910,6 +910,10 @@ def main():
                     "weight":     config["job_weight"],
                 })
 
+        if not all_jobs:
+            print("  All checkpoints already complete — nothing to do.")
+            return
+
         # Greedy bin-packing: assign heaviest jobs first to the least-loaded GPU.
         gpu_jobs: List[List] = [[], []]
         loads = [0.0, 0.0]
@@ -940,8 +944,11 @@ def main():
             )
             procs.append(p)
 
-        for p in procs:
-            p.wait()
+        exit_codes = [p.wait() for p in procs]
+        failed = [gpu_id for gpu_id, code in enumerate(exit_codes) if code != 0]
+        if failed:
+            print(f"\n⚠️  GPU worker(s) {failed} exited with errors — "
+                  f"some checkpoints may be incomplete. Check output above.")
 
         for jf in job_files:
             Path(jf).unlink(missing_ok=True)

@@ -28,6 +28,7 @@ Plots:  Scripts/../Plots/
 """
 
 import argparse
+import json
 import os
 import csv
 import math
@@ -36,6 +37,7 @@ import subprocess
 import sys
 import tempfile
 import warnings
+from itertools import groupby
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -91,31 +93,22 @@ MODEL_CONFIGS = {
         "tokenizer":       "znhoughton/opt-babylm-125m-20eps-seed964",
         "size_label":      "125m",
         "batch_size":      4096,
+        "job_weight":      1.0,   # relative per-checkpoint cost (used for load balancing)
     },
     "znhoughton/opt-babylm-350m-20eps-seed964": {
         "tokens_per_step": 819_200,
         "tokenizer":       "znhoughton/opt-babylm-350m-20eps-seed964",
         "size_label":      "350m",
         "batch_size":      4096,
+        "job_weight":      3.5,
     },
     "znhoughton/opt-babylm-1.3b-20eps-seed964": {
         "tokens_per_step": 1_024_000,
         "tokenizer":       "znhoughton/opt-babylm-1.3b-20eps-seed964",
         "size_label":      "1.3b",
         "batch_size":      2048,  # start high; OOM fallback will halve if needed
+        "job_weight":      26.0,
     },
-}
-
-# Which models each GPU runs when --gpu is passed.
-# GPU 0: two smaller models; GPU 1: the large model alone.
-GPU_MODEL_SPLIT = {
-    0: [
-        "znhoughton/opt-babylm-125m-20eps-seed964",
-        "znhoughton/opt-babylm-350m-20eps-seed964",
-    ],
-    1: [
-        "znhoughton/opt-babylm-1.3b-20eps-seed964",
-    ],
 }
 
 # ---------------------------------------------------------------------------
@@ -768,61 +761,199 @@ def merge_temp_csv(tmp_csv: str, out_csv: str):
     print(f"  Done — temp file removed.")
 
 # ---------------------------------------------------------------------------
+# PER-CHECKPOINT HELPER
+# ---------------------------------------------------------------------------
+
+def _process_checkpoint(
+    model_name: str,
+    config: Dict,
+    ckpt: Dict,
+    tokenizer,
+    binoms_df: "pd.DataFrame",
+    phrase_sentence_map: Dict[str, List[str]],
+    completed: set,
+    device: str,
+    writer,
+    out_file,
+):
+    """Load one checkpoint, extract representations, compute scores, write results."""
+    size_label = config["size_label"]
+    print(f"\n  Checkpoint: {ckpt['checkpoint']}  "
+          f"(step={ckpt['step']}, tokens={ckpt['tokens']:,})")
+
+    tmp_cache = tempfile.mkdtemp(prefix="hf_ckpt_")
+    try:
+        load_kw = dict(low_cpu_mem_usage=True, cache_dir=tmp_cache)
+        if ckpt["tag"]:
+            load_kw["revision"] = ckpt["tag"]
+
+        model = (AutoModel.from_pretrained(model_name, **load_kw).to(device).eval())
+
+        n_chunks = math.ceil(len(binoms_df) / BINOMIAL_CHUNK_SIZE)
+        for chunk_idx in range(n_chunks):
+            chunk_df = binoms_df.iloc[
+                chunk_idx * BINOMIAL_CHUNK_SIZE:(chunk_idx + 1) * BINOMIAL_CHUNK_SIZE
+            ]
+            chunk_df = chunk_df[
+                ~chunk_df["phrase_AB"].apply(
+                    lambda ab: (model_name, ckpt["checkpoint"], ab) in completed
+                )
+            ]
+            if chunk_df.empty:
+                continue
+
+            chunk_map = {
+                p: phrase_sentence_map[p]
+                for _, row in chunk_df.iterrows()
+                for p in (row["phrase_AB"], row["phrase_BA"])
+            }
+
+            print(f"  Extracting chunk {chunk_idx+1}/{n_chunks} ...")
+            chunk_reps = extract_representations(
+                model, tokenizer, chunk_map, device,
+                batch_size=config.get("batch_size", DEFAULT_BATCH_SIZE),
+            )
+
+            print(f"  Computing scores ...")
+            chunk_pairs = [(r["phrase_AB"], r["phrase_BA"]) for _, r in chunk_df.iterrows()]
+            all_scores = compute_scores_batched(chunk_reps, chunk_pairs, device)
+
+            for _, row in chunk_df.iterrows():
+                ab, ba = row["phrase_AB"], row["phrase_BA"]
+                scores = all_scores.get(ab)
+                if not scores:
+                    print(f"    ⚠️  No reps for ({row['Word1']}, {row['Word2']}), skipping.")
+                    continue
+                completed.add((model_name, ckpt["checkpoint"], ab))
+                for score_row in scores:
+                    writer.writerow({
+                        "model":        model_name,
+                        "model_size":   size_label,
+                        "checkpoint":   ckpt["checkpoint"],
+                        "step":         ckpt["step"],
+                        "tokens":       ckpt["tokens"],
+                        "word1":        row["Word1"],
+                        "word2":        row["Word2"],
+                        "phrase_AB":    ab,
+                        "phrase_BA":    ba,
+                        "overall_freq": row.get("OverallFreq", ""),
+                        "rel_freq":     row.get("RelFreq", ""),
+                        **score_row,
+                    })
+
+            del chunk_reps
+            out_file.flush()
+
+        print(f"  ✅ Done.")
+
+    finally:
+        del model
+        torch.cuda.empty_cache()
+        shutil.rmtree(tmp_cache, ignore_errors=True)
+
+
+def _load_tokenizer(config: Dict):
+    tok = AutoTokenizer.from_pretrained(config["tokenizer"], use_fast=True)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    tok.padding_side = "right"
+    return tok
+
+
+# ---------------------------------------------------------------------------
 # MAIN PIPELINE
 # ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--gpu", type=int, default=None, choices=[0, 1],
-        help="GPU split index (0 or 1). Omit to run all models on one GPU.",
-    )
+    parser.add_argument("--gpu", type=int, default=None, choices=[0, 1],
+                        help="Worker GPU index (set by coordinator, not by user).")
+    parser.add_argument("--jobs-file", default=None,
+                        help="JSON file listing this worker's assigned checkpoints.")
     args = parser.parse_args()
 
-    # Auto-spawn two worker processes if multiple GPUs are available and this
-    # is not already a worker (--gpu not set).
+    # ── Multi-GPU coordinator ─────────────────────────────────────────────────
+    # If 2+ GPUs are available and this is not already a worker, act as
+    # coordinator: collect sentences, build the full job list, assign jobs to
+    # GPUs via greedy bin-packing, spawn worker subprocesses, then merge.
     if args.gpu is None and torch.cuda.device_count() >= 2:
-        print(f"Detected {torch.cuda.device_count()} GPUs — spawning 2 parallel workers.")
+        print(f"Detected {torch.cuda.device_count()} GPUs — running with dynamic load balancing.")
+
+        # Sentence collection must finish before workers start (avoids
+        # concurrent writes to SENTENCE_POOL_CSV).
+        print(f"\nLoading binomials ...")
+        binoms_df = load_binomials(BINOMS_CSV)
+        collect_sentences(binoms_df)
+
+        # Build full job list across all models and checkpoints.
+        all_jobs = []
+        for model_name, config in MODEL_CONFIGS.items():
+            ckpts = get_model_checkpoints(model_name, config["tokens_per_step"])
+            if not ckpts:
+                continue
+            ckpts = log_sample_checkpoints(ckpts, n=N_LOG_CHECKPOINTS)
+            for ckpt in ckpts:
+                all_jobs.append({
+                    "model_name": model_name,
+                    "ckpt":       ckpt,
+                    "weight":     config["job_weight"],
+                })
+
+        # Greedy bin-packing: assign heaviest jobs first to the least-loaded GPU.
+        gpu_jobs: List[List] = [[], []]
+        loads = [0.0, 0.0]
+        for job in sorted(all_jobs, key=lambda j: j["weight"], reverse=True):
+            gpu_id = loads.index(min(loads))
+            gpu_jobs[gpu_id].append(job)
+            loads[gpu_id] += job["weight"]
+
+        print(f"  GPU 0: {len(gpu_jobs[0])} checkpoints  (estimated load {loads[0]:.0f})")
+        print(f"  GPU 1: {len(gpu_jobs[1])} checkpoints  (estimated load {loads[1]:.0f})")
+
+        # Write per-GPU job files and spawn workers.
+        os.makedirs(OUT_DIR, exist_ok=True)
+        job_files = []
         procs = []
-        for gpu_id in (0, 1):
+        for gpu_id in range(2):
+            jf = str(Path(OUT_DIR) / f"_jobs_gpu{gpu_id}.json")
+            with open(jf, "w") as f:
+                json.dump(gpu_jobs[gpu_id], f)
+            job_files.append(jf)
+
             env = os.environ.copy()
             env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
             p = subprocess.Popen(
-                [sys.executable, __file__, "--gpu", str(gpu_id)],
+                [sys.executable, __file__,
+                 "--gpu", str(gpu_id), "--jobs-file", jf],
                 env=env,
             )
             procs.append(p)
+
         for p in procs:
             p.wait()
+
+        for jf in job_files:
+            Path(jf).unlink(missing_ok=True)
+
         print("\n🏁 Both GPU workers finished.")
         return
 
-    if args.gpu is not None:
-        models_to_run = {k: v for k, v in MODEL_CONFIGS.items()
-                         if k in GPU_MODEL_SPLIT[args.gpu]}
-        active_csv = str(Path(OUT_CSV).with_name(
-            Path(OUT_CSV).stem + f"_gpu{args.gpu}_tmp.csv"
-        ))
-        print(f"GPU split {args.gpu}: running {list(models_to_run)} → {active_csv}")
-    else:
-        models_to_run = MODEL_CONFIGS
-        active_csv = OUT_CSV
+    # ── Worker / single-GPU path ──────────────────────────────────────────────
+    active_csv = (
+        str(Path(OUT_CSV).with_name(Path(OUT_CSV).stem + f"_gpu{args.gpu}_tmp.csv"))
+        if args.gpu is not None else OUT_CSV
+    )
 
-    # ── Load attested binomials ───────────────────────────────────────────────
     print(f"Loading binomials ...")
     binoms_df = load_binomials(BINOMS_CSV)
-
-    # ── Collect sentences via Claude API ─────────────────────────────────────
     sentences_by_phrase = collect_sentences(binoms_df)
 
-    # ── Hard-skip check ───────────────────────────────────────────────────────
     if MIN_SENTENCES_HARD > 0:
         skip_mask = binoms_df.apply(
             lambda r: (
                 len(sentences_by_phrase.get(r["phrase_AB"], [])) < MIN_SENTENCES_HARD
-                or
-                len(sentences_by_phrase.get(r["phrase_BA"], [])) < MIN_SENTENCES_HARD
-            ), axis=1
+                or len(sentences_by_phrase.get(r["phrase_BA"], [])) < MIN_SENTENCES_HARD
+            ), axis=1,
         )
         if skip_mask.any():
             print(f"\n⛔ Hard-skipping {skip_mask.sum()} binomials "
@@ -831,128 +962,60 @@ def main():
 
     print(f"\n{len(binoms_df)} binomials proceeding to representation analysis.")
 
-    # ── Build phrase→sentence map for extraction ──────────────────────────────
     phrase_sentence_map: Dict[str, List[str]] = {}
     for _, row in binoms_df.iterrows():
         phrase_sentence_map[row["phrase_AB"]] = sentences_by_phrase[row["phrase_AB"]]
         phrase_sentence_map[row["phrase_BA"]] = sentences_by_phrase[row["phrase_BA"]]
 
-    # ── Open results CSV ──────────────────────────────────────────────────────
     os.makedirs(OUT_DIR, exist_ok=True)
-    # Read from both the main CSV and this GPU's temp file so we skip work
-    # already done by either a previous run or the other GPU process.
     csv_sources = [OUT_CSV] if active_csv == OUT_CSV else [OUT_CSV, active_csv]
     completed = load_completed(csv_sources)
     if completed:
         print(f"  Resuming — {len(completed)} (model, checkpoint, binomial) combinations already done.")
     out_file, writer = open_results_file(active_csv)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     try:
-        for model_name, config in models_to_run.items():
-            size_label = config["size_label"]
-            print(f"\n{'='*60}")
-            print(f"Model: {model_name}  [{size_label}]")
-            print("=" * 60)
+        if args.jobs_file:
+            # ── Dynamic worker: process the coordinator-assigned job list ─────
+            with open(args.jobs_file) as f:
+                my_jobs = json.load(f)
+            print(f"  GPU {args.gpu} worker: {len(my_jobs)} checkpoints assigned.")
 
-            checkpoints = get_model_checkpoints(model_name,
-                                                config["tokens_per_step"])
-            if not checkpoints:
-                print("  No checkpoints found, skipping.")
-                continue
-            checkpoints = log_sample_checkpoints(checkpoints, n=N_LOG_CHECKPOINTS)
-
-            tokenizer = AutoTokenizer.from_pretrained(
-                config["tokenizer"], use_fast=True)
-            if tokenizer.pad_token is None:
-                tokenizer.pad_token = tokenizer.eos_token
-            tokenizer.padding_side = "right"
-
-            for ckpt in checkpoints:
-                print(f"\n  Checkpoint: {ckpt['checkpoint']}  "
-                      f"(step={ckpt['step']}, tokens={ckpt['tokens']:,})")
-
-                tmp_cache = tempfile.mkdtemp(prefix="hf_ckpt_")
-                try:
-                    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-                    load_kw = dict(
-                        low_cpu_mem_usage=True,
-                        cache_dir=tmp_cache,
+            # Group by model so the tokenizer is loaded once per model.
+            for model_name, model_jobs in groupby(
+                sorted(my_jobs, key=lambda j: j["model_name"]),
+                key=lambda j: j["model_name"],
+            ):
+                config = MODEL_CONFIGS[model_name]
+                print(f"\n{'='*60}")
+                print(f"Model: {model_name}  [{config['size_label']}]  (GPU {args.gpu})")
+                print("=" * 60)
+                tokenizer = _load_tokenizer(config)
+                for job in model_jobs:
+                    _process_checkpoint(
+                        model_name, config, job["ckpt"], tokenizer,
+                        binoms_df, phrase_sentence_map, completed,
+                        device, writer, out_file,
                     )
-                    if ckpt["tag"]:
-                        load_kw["revision"] = ckpt["tag"]
-
-                    model = (AutoModel
-                             .from_pretrained(model_name, **load_kw)
-                             .to(device)
-                             .eval())
-
-                    n_chunks = math.ceil(len(binoms_df) / BINOMIAL_CHUNK_SIZE)
-                    for chunk_idx in range(n_chunks):
-                        chunk_df = binoms_df.iloc[
-                            chunk_idx * BINOMIAL_CHUNK_SIZE:
-                            (chunk_idx + 1) * BINOMIAL_CHUNK_SIZE
-                        ]
-                        chunk_df = chunk_df[
-                            ~chunk_df["phrase_AB"].apply(
-                                lambda ab: (model_name, ckpt["checkpoint"], ab) in completed
-                            )
-                        ]
-                        if chunk_df.empty:
-                            continue
-
-                        chunk_map = {
-                            p: phrase_sentence_map[p]
-                            for _, row in chunk_df.iterrows()
-                            for p in (row["phrase_AB"], row["phrase_BA"])
-                        }
-
-                        print(f"  Extracting chunk {chunk_idx+1}/{n_chunks} ...")
-                        chunk_reps = extract_representations(
-                            model, tokenizer, chunk_map, device,
-                            batch_size=config.get("batch_size", DEFAULT_BATCH_SIZE),
-                        )
-
-                        print(f"  Computing scores ...")
-                        chunk_pairs = [(r["phrase_AB"], r["phrase_BA"])
-                                       for _, r in chunk_df.iterrows()]
-                        all_scores = compute_scores_batched(
-                            chunk_reps, chunk_pairs, device)
-
-                        for _, row in chunk_df.iterrows():
-                            ab, ba = row["phrase_AB"], row["phrase_BA"]
-                            scores = all_scores.get(ab)
-                            if not scores:
-                                print(f"    ⚠️  No reps for ({row['Word1']}, "
-                                      f"{row['Word2']}), skipping.")
-                                continue
-                            completed.add((model_name, ckpt["checkpoint"], ab))
-                            for score_row in scores:
-                                writer.writerow({
-                                    "model":        model_name,
-                                    "model_size":   size_label,
-                                    "checkpoint":   ckpt["checkpoint"],
-                                    "step":         ckpt["step"],
-                                    "tokens":       ckpt["tokens"],
-                                    "word1":        row["Word1"],
-                                    "word2":        row["Word2"],
-                                    "phrase_AB":    ab,
-                                    "phrase_BA":    ba,
-                                    "overall_freq": row.get("OverallFreq", ""),
-                                    "rel_freq":     row.get("RelFreq", ""),
-                                    **score_row,
-                                })
-
-                        del chunk_reps
-                        out_file.flush()
-
-                    print(f"  ✅ Done.")
-
-                finally:
-                    del model
-                    torch.cuda.empty_cache()
-                    shutil.rmtree(tmp_cache, ignore_errors=True)
-
+        else:
+            # ── Single-GPU: process all models sequentially ───────────────────
+            for model_name, config in MODEL_CONFIGS.items():
+                print(f"\n{'='*60}")
+                print(f"Model: {model_name}  [{config['size_label']}]")
+                print("=" * 60)
+                checkpoints = get_model_checkpoints(model_name, config["tokens_per_step"])
+                if not checkpoints:
+                    print("  No checkpoints found, skipping.")
+                    continue
+                checkpoints = log_sample_checkpoints(checkpoints, n=N_LOG_CHECKPOINTS)
+                tokenizer = _load_tokenizer(config)
+                for ckpt in checkpoints:
+                    _process_checkpoint(
+                        model_name, config, ckpt, tokenizer,
+                        binoms_df, phrase_sentence_map, completed,
+                        device, writer, out_file,
+                    )
     finally:
         out_file.close()
 

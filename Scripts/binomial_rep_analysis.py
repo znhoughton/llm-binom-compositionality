@@ -892,6 +892,18 @@ def main():
     if args.gpu is None and torch.cuda.device_count() >= 2:
         print(f"Detected {torch.cuda.device_count()} GPUs — running with dynamic load balancing.")
 
+        # Merge any leftover temp CSVs from a previous interrupted run so that
+        # load_completed sees all previously written results and doesn't re-run
+        # checkpoints that are already done.
+        os.makedirs(OUT_DIR, exist_ok=True)
+        for gpu_id in range(torch.cuda.device_count()):
+            tmp = str(Path(OUT_CSV).with_name(
+                Path(OUT_CSV).stem + f"_gpu{gpu_id}_tmp.csv"
+            ))
+            if Path(tmp).exists():
+                print(f"  Found leftover temp file from previous run — merging {Path(tmp).name} ...")
+                merge_temp_csv(tmp, OUT_CSV)
+
         # Sentence collection must finish before workers start (avoids
         # concurrent writes to SENTENCE_POOL_CSV).
         print(f"\nLoading binomials ...")

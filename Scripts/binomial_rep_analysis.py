@@ -948,12 +948,9 @@ def main():
                 json.dump(gpu_jobs[gpu_id], f)
             job_files.append(jf)
 
-            env = os.environ.copy()
-            env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
             p = subprocess.Popen(
                 [sys.executable, __file__,
                  "--gpu", str(gpu_id), "--jobs-file", jf],
-                env=env,
             )
             procs.append(p)
 
@@ -1012,7 +1009,10 @@ def main():
     if completed:
         print(f"  Resuming — {len(completed)} (model, checkpoint, binomial) combinations already done.")
     out_file, writer = open_results_file(active_csv)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.gpu is not None and torch.cuda.is_available():
+        device = f"cuda:{args.gpu}"
+    else:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
 
     try:
         if args.jobs_file:

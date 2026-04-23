@@ -1,0 +1,329 @@
+---
+title: "Binomial Representation Analysis"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 9, fig.height = 5)
+```
+
+## Setup
+
+```{r packages}
+library(tidyverse)
+library(brms)
+library(tidybayes)
+library(patchwork)
+```
+
+```{r load-data}
+df_raw <- read_csv("../results/binomial_representations.csv")
+
+# Each row is one (model × checkpoint × binomial × layer) observation.
+# self_sim_AB is always ≤ 0: closer to 0 = more consistent across contexts.
+# procrustes_dist is normalised residual of Procrustes(AB → BA): lower = better alignment.
+glimpse(df_raw)
+```
+
+## Data Preparation
+
+```{r prep}
+# Keep only the last layer per model (most processed representation).
+# 125m: layer 12, 350m/1.3b: layer 24.
+last_layer <- df_raw %>%
+  group_by(model_size) %>%
+  summarise(last_layer = max(layer), .groups = "drop")
+
+df <- df_raw %>%
+  left_join(last_layer, by = "model_size") %>%
+  filter(layer == last_layer) %>%
+  select(-last_layer) %>%
+  mutate(
+    log_freq    = log(overall_freq),
+    log_tokens  = log(tokens),
+    # Negate self_sim so higher = more consistent (easier to interpret)
+    consistency = -self_sim_AB,
+    model_size  = factor(model_size, levels = c("125m", "350m", "1.3b"))
+  )
+
+# Label early / mid / final checkpoints per model
+checkpoint_labels <- df %>%
+  distinct(model_size, step, tokens) %>%
+  group_by(model_size) %>%
+  arrange(step) %>%
+  mutate(ckpt_label = case_when(
+    row_number() == 1          ~ "early",
+    row_number() == n()        ~ "final",
+    row_number() == round(n() / 2) ~ "mid",
+    TRUE                       ~ NA_character_
+  )) %>%
+  filter(!is.na(ckpt_label)) %>%
+  ungroup()
+
+df_labeled <- df %>%
+  left_join(checkpoint_labels %>% select(model_size, step, ckpt_label),
+            by = c("model_size", "step"))
+
+cat("Rows per checkpoint label:\n")
+print(count(df_labeled %>% filter(!is.na(ckpt_label)), model_size, ckpt_label, step))
+```
+
+## Visualisations
+
+### Procrustes distance vs consistency at final checkpoint
+
+```{r viz-consistency, fig.height=4}
+df_final <- df_labeled %>% filter(ckpt_label == "final")
+
+p1 <- ggplot(df_final, aes(x = consistency, y = procrustes_dist, colour = model_size)) +
+  geom_point(alpha = 0.25, size = 0.8) +
+  geom_smooth(method = "lm", se = TRUE) +
+  scale_colour_brewer(palette = "Set1") +
+  labs(
+    x     = "Consistency (−self_sim_AB; higher = more consistent)",
+    y     = "Procrustes distance",
+    title = "Procrustes distance vs representation consistency (final checkpoint, last layer)",
+    colour = "Model"
+  ) +
+  theme_minimal()
+p1
+```
+
+### Procrustes distance vs overall frequency at final checkpoint
+
+```{r viz-freq, fig.height=4}
+p2 <- ggplot(df_final, aes(x = log_freq, y = procrustes_dist, colour = model_size)) +
+  geom_point(alpha = 0.25, size = 0.8) +
+  geom_smooth(method = "lm", se = TRUE) +
+  scale_colour_brewer(palette = "Set1") +
+  labs(
+    x     = "log(overall frequency)",
+    y     = "Procrustes distance",
+    title = "Procrustes distance vs corpus frequency (final checkpoint, last layer)",
+    colour = "Model"
+  ) +
+  theme_minimal()
+p2
+```
+
+### Consistency vs frequency (to understand predictor correlation)
+
+```{r viz-pred-corr, fig.height=4}
+p3 <- ggplot(df_final, aes(x = log_freq, y = consistency, colour = model_size)) +
+  geom_point(alpha = 0.2, size = 0.8) +
+  geom_smooth(method = "lm", se = TRUE) +
+  scale_colour_brewer(palette = "Set1") +
+  labs(
+    x = "log(overall frequency)",
+    y = "Consistency (−self_sim_AB)",
+    title = "Predictor correlation: consistency vs frequency"
+  ) +
+  theme_minimal()
+p3
+```
+
+### Procrustes distance across training
+
+```{r viz-training, fig.height=5}
+df_avg <- df %>%
+  group_by(model_size, log_tokens, tokens) %>%
+  summarise(mean_proc = mean(procrustes_dist),
+            se_proc   = sd(procrustes_dist) / sqrt(n()),
+            .groups = "drop")
+
+p4 <- ggplot(df_avg, aes(x = log_tokens, y = mean_proc,
+                          colour = model_size, fill = model_size)) +
+  geom_ribbon(aes(ymin = mean_proc - se_proc,
+                  ymax = mean_proc + se_proc), alpha = 0.2, colour = NA) +
+  geom_line(linewidth = 0.8) +
+  scale_colour_brewer(palette = "Set1") +
+  scale_fill_brewer(palette = "Set1") +
+  labs(
+    x      = "log(tokens seen)",
+    y      = "Mean Procrustes distance",
+    title  = "Procrustes distance over training (last layer, mean ± SE across binomials)",
+    colour = "Model", fill = "Model"
+  ) +
+  theme_minimal()
+p4
+```
+
+## brms Models
+
+Outcome: `procrustes_dist` (normalised Procrustes residual, 0–1).
+Predictors: `consistency` (−self_sim_AB) and `log_freq`, both scaled.
+Random effect: `(1 | phrase_AB)` for between-binomial variation.
+
+All predictors are scaled within each model fit so coefficients are in
+comparable units. Model family: Gaussian (a beta regression would be more
+appropriate for a bounded outcome but Gaussian is a reasonable starting point).
+
+```{r brms-priors}
+priors_base <- c(
+  prior(normal(0, 1),   class = b),
+  prior(normal(0.5, 1), class = Intercept),
+  prior(exponential(1), class = sd),
+  prior(exponential(1), class = sigma)
+)
+```
+
+### Models at early, mid, and final checkpoints
+
+```{r brms-checkpoint-models, results="hide"}
+make_ckpt_df <- function(label) {
+  df_labeled %>%
+    filter(ckpt_label == label) %>%
+    mutate(
+      cons_sc  = as.vector(scale(consistency)),
+      freq_sc  = as.vector(scale(log_freq))
+    )
+}
+
+df_early <- make_ckpt_df("early")
+df_mid   <- make_ckpt_df("mid")
+df_final_sc <- make_ckpt_df("final")
+
+formula_base <- procrustes_dist ~ cons_sc * freq_sc + model_size + (1 | phrase_AB)
+
+m_early <- brm(
+  formula_base,
+  data    = df_early,
+  prior   = priors_base,
+  family  = gaussian(),
+  cores   = 4,
+  iter    = 2000,
+  seed    = 42,
+  file    = "../results/m_early"
+)
+
+m_mid <- brm(
+  formula_base,
+  data    = df_mid,
+  prior   = priors_base,
+  family  = gaussian(),
+  cores   = 4,
+  iter    = 2000,
+  seed    = 42,
+  file    = "../results/m_mid"
+)
+
+m_final <- brm(
+  formula_base,
+  data    = df_final_sc,
+  prior   = priors_base,
+  family  = gaussian(),
+  cores   = 4,
+  iter    = 2000,
+  seed    = 42,
+  file    = "../results/m_final"
+)
+```
+
+```{r checkpoint-summaries}
+cat("=== Early checkpoint ===\n");  print(summary(m_early))
+cat("\n=== Mid checkpoint ===\n");  print(summary(m_mid))
+cat("\n=== Final checkpoint ===\n"); print(summary(m_final))
+```
+
+```{r checkpoint-coef-plot, fig.height=6}
+tidy_model <- function(m, label) {
+  as_draws_df(m) %>%
+    select(starts_with("b_")) %>%
+    pivot_longer(everything(), names_to = "term", values_to = "estimate") %>%
+    filter(term != "b_Intercept") %>%
+    mutate(checkpoint = label)
+}
+
+coef_df <- bind_rows(
+  tidy_model(m_early, "early"),
+  tidy_model(m_mid,   "mid"),
+  tidy_model(m_final, "final")
+) %>%
+  mutate(checkpoint = factor(checkpoint, levels = c("early", "mid", "final")))
+
+ggplot(coef_df, aes(x = estimate, y = term, fill = checkpoint)) +
+  stat_halfeye(position = position_dodge(width = 0.6), alpha = 0.7) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    x     = "Posterior estimate",
+    y     = "Term",
+    title = "Coefficients across early / mid / final checkpoints",
+    fill  = "Checkpoint"
+  ) +
+  theme_minimal()
+```
+
+### Full model: effect of training progress
+
+Uses all checkpoints. `log_tokens_sc` captures training progress on a log scale
+(comparable across model sizes).
+
+```{r brms-full-model, results="hide"}
+df_full <- df %>%
+  mutate(
+    cons_sc       = as.vector(scale(consistency)),
+    freq_sc       = as.vector(scale(log_freq)),
+    log_tokens_sc = as.vector(scale(log_tokens))
+  )
+
+m_full <- brm(
+  procrustes_dist ~ cons_sc * freq_sc * log_tokens_sc + model_size + (1 | phrase_AB),
+  data   = df_full,
+  prior  = c(
+    prior(normal(0, 1),   class = b),
+    prior(normal(0.5, 1), class = Intercept),
+    prior(exponential(1), class = sd),
+    prior(exponential(1), class = sigma)
+  ),
+  family = gaussian(),
+  cores  = 4,
+  iter   = 2000,
+  seed   = 42,
+  file   = "../results/m_full"
+)
+```
+
+```{r full-summary}
+summary(m_full)
+```
+
+```{r full-coef-plot, fig.height=5}
+as_draws_df(m_full) %>%
+  select(starts_with("b_")) %>%
+  pivot_longer(everything(), names_to = "term", values_to = "estimate") %>%
+  filter(term != "b_Intercept") %>%
+  ggplot(aes(x = estimate, y = term)) +
+  stat_halfeye(fill = "#4393c3", alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  labs(
+    x     = "Posterior estimate",
+    y     = "Term",
+    title = "Full model coefficients (all checkpoints)"
+  ) +
+  theme_minimal()
+```
+
+### Conditional effects: consistency × frequency interaction
+
+```{r cond-effects-final, fig.height=4}
+ce <- conditional_effects(
+  m_final,
+  effects  = "cons_sc:freq_sc",
+  re_formula = NA
+)
+plot(ce, plot = FALSE)[[1]] +
+  labs(
+    x     = "Consistency (scaled)",
+    y     = "Procrustes distance",
+    title = "Consistency × frequency interaction (final checkpoint)",
+    colour = "log(freq) (scaled)",
+    fill   = "log(freq) (scaled)"
+  ) +
+  theme_minimal()
+```

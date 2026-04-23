@@ -27,6 +27,7 @@ Output: Scripts/../results/binomial_representations.csv
 Plots:  Scripts/../Plots/
 """
 
+import argparse
 import os
 import csv
 import math
@@ -101,6 +102,18 @@ MODEL_CONFIGS = {
         "size_label":      "1.3b",
         "batch_size":      2048,  # start high; OOM fallback will halve if needed
     },
+}
+
+# Which models each GPU runs when --gpu is passed.
+# GPU 0: two smaller models; GPU 1: the large model alone.
+GPU_MODEL_SPLIT = {
+    0: [
+        "znhoughton/opt-babylm-125m-20eps-seed964",
+        "znhoughton/opt-babylm-350m-20eps-seed964",
+    ],
+    1: [
+        "znhoughton/opt-babylm-1.3b-20eps-seed964",
+    ],
 }
 
 # ---------------------------------------------------------------------------
@@ -693,21 +706,27 @@ FIELDNAMES = [
 ]
 
 
-def load_completed(out_csv: str) -> set:
+def load_completed(csv_paths) -> set:
     """
     Returns set of (model, checkpoint, phrase_AB) that have a full layer set.
-    Infers the expected layer count from the most common count in the CSV;
+    Accepts a single path or a list of paths — all are read and merged so that
+    results already in the main CSV and results written to a temp CSV during a
+    parallel run are both respected.
+    Infers the expected layer count from the most common count across all files;
     any entry with fewer rows is treated as incomplete and will be re-run.
     """
-    if not Path(out_csv).exists():
-        return set()
+    if isinstance(csv_paths, str):
+        csv_paths = [csv_paths]
 
     from collections import Counter
     layer_counts: Dict[tuple, int] = {}
-    with open(out_csv, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            key = (row["model"], row["checkpoint"], row["phrase_AB"])
-            layer_counts[key] = layer_counts.get(key, 0) + 1
+    for path in csv_paths:
+        if not Path(path).exists():
+            continue
+        with open(path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                key = (row["model"], row["checkpoint"], row["phrase_AB"])
+                layer_counts[key] = layer_counts.get(key, 0) + 1
 
     if not layer_counts:
         return set()
@@ -729,11 +748,46 @@ def open_results_file(out_csv: str):
         w.writeheader()
     return f, w
 
+def merge_temp_csv(tmp_csv: str, out_csv: str):
+    """Append all rows from tmp_csv into out_csv, then delete tmp_csv."""
+    if not Path(tmp_csv).exists():
+        return
+    print(f"\n  Merging {Path(tmp_csv).name} → {Path(out_csv).name} ...")
+    exists = Path(out_csv).exists()
+    with open(tmp_csv, newline="", encoding="utf-8") as f_in, \
+         open(out_csv, "a", newline="", encoding="utf-8") as f_out:
+        reader = csv.DictReader(f_in)
+        writer = csv.DictWriter(f_out, fieldnames=FIELDNAMES, extrasaction="ignore")
+        if not exists:
+            writer.writeheader()
+        for row in reader:
+            writer.writerow(row)
+    Path(tmp_csv).unlink()
+    print(f"  Done — temp file removed.")
+
 # ---------------------------------------------------------------------------
 # MAIN PIPELINE
 # ---------------------------------------------------------------------------
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--gpu", type=int, default=None, choices=[0, 1],
+        help="GPU split index (0 or 1). Omit to run all models on one GPU.",
+    )
+    args = parser.parse_args()
+
+    if args.gpu is not None:
+        models_to_run = {k: v for k, v in MODEL_CONFIGS.items()
+                         if k in GPU_MODEL_SPLIT[args.gpu]}
+        active_csv = str(Path(OUT_CSV).with_name(
+            Path(OUT_CSV).stem + f"_gpu{args.gpu}_tmp.csv"
+        ))
+        print(f"GPU split {args.gpu}: running {list(models_to_run)} → {active_csv}")
+    else:
+        models_to_run = MODEL_CONFIGS
+        active_csv = OUT_CSV
+
     # ── Load attested binomials ───────────────────────────────────────────────
     print(f"Loading binomials ...")
     binoms_df = load_binomials(BINOMS_CSV)
@@ -765,13 +819,16 @@ def main():
 
     # ── Open results CSV ──────────────────────────────────────────────────────
     os.makedirs(OUT_DIR, exist_ok=True)
-    completed = load_completed(OUT_CSV)
+    # Read from both the main CSV and this GPU's temp file so we skip work
+    # already done by either a previous run or the other GPU process.
+    csv_sources = [OUT_CSV] if active_csv == OUT_CSV else [OUT_CSV, active_csv]
+    completed = load_completed(csv_sources)
     if completed:
         print(f"  Resuming — {len(completed)} (model, checkpoint, binomial) combinations already done.")
-    out_file, writer = open_results_file(OUT_CSV)
+    out_file, writer = open_results_file(active_csv)
 
     try:
-        for model_name, config in MODEL_CONFIGS.items():
+        for model_name, config in models_to_run.items():
             size_label = config["size_label"]
             print(f"\n{'='*60}")
             print(f"Model: {model_name}  [{size_label}]")
@@ -878,6 +935,9 @@ def main():
 
     finally:
         out_file.close()
+
+    if active_csv != OUT_CSV:
+        merge_temp_csv(active_csv, OUT_CSV)
 
     print(f"\n🏁 Pipeline complete.  Results → {OUT_CSV}")
 

@@ -885,7 +885,16 @@ def main():
         binoms_df = load_binomials(BINOMS_CSV)
         collect_sentences(binoms_df)
 
-        # Build full job list across all models and checkpoints.
+        # Build full job list, skipping checkpoints already fully complete.
+        # A checkpoint is complete when every binomial has a full layer set.
+        existing_completed = load_completed(OUT_CSV)
+        n_binomials = len(binoms_df)
+        from collections import Counter
+        ckpt_done_counts = Counter(
+            (model, ckpt_name)
+            for model, ckpt_name, _ in existing_completed
+        )
+
         all_jobs = []
         for model_name, config in MODEL_CONFIGS.items():
             ckpts = get_model_checkpoints(model_name, config["tokens_per_step"])
@@ -893,6 +902,8 @@ def main():
                 continue
             ckpts = log_sample_checkpoints(ckpts, n=N_LOG_CHECKPOINTS)
             for ckpt in ckpts:
+                if ckpt_done_counts.get((model_name, ckpt["checkpoint"]), 0) >= n_binomials:
+                    continue  # all binomials done for this checkpoint
                 all_jobs.append({
                     "model_name": model_name,
                     "ckpt":       ckpt,
@@ -934,6 +945,14 @@ def main():
 
         for jf in job_files:
             Path(jf).unlink(missing_ok=True)
+
+        # Merge temp CSVs sequentially here (not in workers) to avoid
+        # concurrent writes to OUT_CSV if both workers finish near-simultaneously.
+        for gpu_id in range(2):
+            tmp = str(Path(OUT_CSV).with_name(
+                Path(OUT_CSV).stem + f"_gpu{gpu_id}_tmp.csv"
+            ))
+            merge_temp_csv(tmp, OUT_CSV)
 
         print("\n🏁 Both GPU workers finished.")
         return
@@ -1019,7 +1038,9 @@ def main():
     finally:
         out_file.close()
 
-    if active_csv != OUT_CSV:
+    # In coordinated mode (--jobs-file set) the coordinator handles merging
+    # after all workers exit. Only merge here for standalone --gpu runs.
+    if active_csv != OUT_CSV and args.jobs_file is None:
         merge_temp_csv(active_csv, OUT_CSV)
 
     print(f"\n🏁 Pipeline complete.  Results → {OUT_CSV}")

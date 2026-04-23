@@ -81,7 +81,7 @@ MAX_PER_REQUEST  = 80
 
 DEFAULT_BATCH_SIZE  = 512
 N_LOG_CHECKPOINTS   = 20
-BINOMIAL_CHUNK_SIZE = 594   # process all binomials in one chunk on A100
+BINOMIAL_CHUNK_SIZE = 100   # ~20 GB peak CPU RAM per worker for 1.3b (2×100×500×25×2048×4 bytes)
 
 # Actual padded seq_len is driven by the batch's longest sentence (~40–60 tokens
 # for these short phrases), not max_length=512, so memory is far lower than the

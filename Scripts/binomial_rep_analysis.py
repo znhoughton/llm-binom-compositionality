@@ -1034,8 +1034,10 @@ def main():
             print(f"  GPU {args.gpu} worker: {len(my_jobs)} checkpoints assigned.")
 
             # Group by model so the tokenizer is loaded once per model.
+            # Sort by weight ascending (smallest model first) so lighter jobs
+            # finish quickly before the long heavy-model run begins.
             for model_name, model_jobs in groupby(
-                sorted(my_jobs, key=lambda j: j["model_name"]),
+                sorted(my_jobs, key=lambda j: (j["weight"], j["model_name"])),
                 key=lambda j: j["model_name"],
             ):
                 config = MODEL_CONFIGS[model_name]

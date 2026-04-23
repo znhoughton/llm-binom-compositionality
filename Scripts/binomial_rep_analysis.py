@@ -32,6 +32,8 @@ import os
 import csv
 import math
 import shutil
+import subprocess
+import sys
 import tempfile
 import warnings
 from pathlib import Path
@@ -776,6 +778,24 @@ def main():
         help="GPU split index (0 or 1). Omit to run all models on one GPU.",
     )
     args = parser.parse_args()
+
+    # Auto-spawn two worker processes if multiple GPUs are available and this
+    # is not already a worker (--gpu not set).
+    if args.gpu is None and torch.cuda.device_count() >= 2:
+        print(f"Detected {torch.cuda.device_count()} GPUs — spawning 2 parallel workers.")
+        procs = []
+        for gpu_id in (0, 1):
+            env = os.environ.copy()
+            env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+            p = subprocess.Popen(
+                [sys.executable, __file__, "--gpu", str(gpu_id)],
+                env=env,
+            )
+            procs.append(p)
+        for p in procs:
+            p.wait()
+        print("\n🏁 Both GPU workers finished.")
+        return
 
     if args.gpu is not None:
         models_to_run = {k: v for k, v in MODEL_CONFIGS.items()

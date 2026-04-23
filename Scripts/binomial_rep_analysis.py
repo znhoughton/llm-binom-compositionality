@@ -707,13 +707,15 @@ def load_completed(csv_paths) -> set:
     Accepts a single path or a list of paths — all are read and merged so that
     results already in the main CSV and results written to a temp CSV during a
     parallel run are both respected.
-    Infers the expected layer count from the most common count across all files;
-    any entry with fewer rows is treated as incomplete and will be re-run.
+    Infers the expected layer count per model separately (different model sizes
+    have different depths, e.g. 125m=13 layers, 350m/1.3b=25 layers), so the
+    mode is computed within each model group, not globally.
+    Any entry with fewer rows than its model's mode is treated as incomplete.
     """
     if isinstance(csv_paths, str):
         csv_paths = [csv_paths]
 
-    from collections import Counter
+    from collections import Counter, defaultdict
     layer_counts: Dict[tuple, int] = {}
     for path in csv_paths:
         if not Path(path).exists():
@@ -726,12 +728,21 @@ def load_completed(csv_paths) -> set:
     if not layer_counts:
         return set()
 
-    expected = Counter(layer_counts.values()).most_common(1)[0][0]
-    incomplete = [k for k, v in layer_counts.items() if v < expected]
-    if incomplete:
-        print(f"  ⚠️  {len(incomplete)} incomplete entries (< {expected} layers) "
-              f"will be re-run.")
-    return {k for k, v in layer_counts.items() if v == expected}
+    # Group by model name so each model's expected layer count is computed
+    # independently (models of different sizes have different layer counts).
+    model_groups: Dict[str, Dict[tuple, int]] = defaultdict(dict)
+    for key, count in layer_counts.items():
+        model_groups[key[0]][key] = count
+
+    completed: set = set()
+    for model_name, mc in model_groups.items():
+        expected = Counter(mc.values()).most_common(1)[0][0]
+        incomplete = [k for k, v in mc.items() if v < expected]
+        if incomplete:
+            print(f"  ⚠️  {len(incomplete)} incomplete entries for {model_name} "
+                  f"(< {expected} layers) will be re-run.")
+        completed.update(k for k, v in mc.items() if v == expected)
+    return completed
 
 
 def open_results_file(out_csv: str):
@@ -782,6 +793,7 @@ def _process_checkpoint(
           f"(step={ckpt['step']}, tokens={ckpt['tokens']:,})")
 
     tmp_cache = tempfile.mkdtemp(prefix="hf_ckpt_")
+    model = None
     try:
         load_kw = dict(low_cpu_mem_usage=True, cache_dir=tmp_cache)
         if ckpt["tag"]:
@@ -847,7 +859,8 @@ def _process_checkpoint(
         print(f"  ✅ Done.")
 
     finally:
-        del model
+        if model is not None:
+            del model
         torch.cuda.empty_cache()
         shutil.rmtree(tmp_cache, ignore_errors=True)
 

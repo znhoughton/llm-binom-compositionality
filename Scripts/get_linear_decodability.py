@@ -167,32 +167,36 @@ def process_checkpoint(
                 keep = {int(x) for x in layers_filter.split(",")}
                 all_layers = [l for l in all_layers if l in keep]
 
-            for layer_idx in tqdm(all_layers, desc="  Layers"):
-                for _, row in chunk_df.iterrows():
-                    ab, ba = row["phrase_AB"], row["phrase_BA"]
-                    if (model_name, ckpt["checkpoint"], ab, layer_idx) in completed:
-                        continue
-                    reps_ab = chunk_reps.get(ab, {}).get(layer_idx)
-                    reps_ba = chunk_reps.get(ba, {}).get(layer_idx)
-                    if reps_ab is None or reps_ba is None:
-                        continue
+            for layer_idx in tqdm(all_layers, desc="  Layers", position=0):
+                rows = list(chunk_df.iterrows())
+                with tqdm(rows, desc=f"    layer {layer_idx:>2d}  binomials",
+                          position=1, leave=False) as binom_bar:
+                    for _, row in binom_bar:
+                        ab, ba = row["phrase_AB"], row["phrase_BA"]
+                        binom_bar.set_postfix_str(ab, refresh=False)
+                        if (model_name, ckpt["checkpoint"], ab, layer_idx) in completed:
+                            continue
+                        reps_ab = chunk_reps.get(ab, {}).get(layer_idx)
+                        reps_ba = chunk_reps.get(ba, {}).get(layer_idx)
+                        if reps_ab is None or reps_ba is None:
+                            continue
 
-                    logits, labels = get_fold_predictions(reps_ab, reps_ba)
-                    if logits is None:
-                        continue
-                    completed.add((model_name, ckpt["checkpoint"], ab, layer_idx))
-                    for logit, label in zip(logits, labels):
-                        writer.writerow({
-                            "model":      model_name,
-                            "model_size": size_label,
-                            "checkpoint": ckpt["checkpoint"],
-                            "step":       ckpt["step"],
-                            "tokens":     ckpt["tokens"],
-                            "phrase_AB":  ab,
-                            "layer":      layer_idx,
-                            "label":      int(label),
-                            "logit":      float(logit),
-                        })
+                        logits, labels = get_fold_predictions(reps_ab, reps_ba)
+                        if logits is None:
+                            continue
+                        completed.add((model_name, ckpt["checkpoint"], ab, layer_idx))
+                        for logit, label in zip(logits, labels):
+                            writer.writerow({
+                                "model":      model_name,
+                                "model_size": size_label,
+                                "checkpoint": ckpt["checkpoint"],
+                                "step":       ckpt["step"],
+                                "tokens":     ckpt["tokens"],
+                                "phrase_AB":  ab,
+                                "layer":      layer_idx,
+                                "label":      int(label),
+                                "logit":      float(logit),
+                            })
 
                 out_file.flush()
 

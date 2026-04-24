@@ -27,7 +27,8 @@ df_raw <- read_csv("../results/binomial_representations.csv")
 # Replace web-corpus frequency estimates with counts from the BabyLM training
 # corpus (produced by Scripts/get_corpus_freqs.py).
 corpus_freqs <- read_csv("../Data/babylm_corpus_freqs.csv") %>%
-  select(phrase_AB, corpus_freq = overall_freq, corpus_rel_freq = rel_freq)
+  select(phrase_AB, corpus_freq = overall_freq, corpus_rel_freq = rel_freq,
+         freq_AB, freq_BA)
 
 df_raw <- df_raw %>%
   select(-overall_freq, -rel_freq) %>%
@@ -53,8 +54,10 @@ df <- df_raw %>%
   filter(layer == last_layer) %>%
   select(-last_layer) %>%
   mutate(
-    log_freq    = log1p(corpus_freq),   # log1p handles any zero-count binomials
-    log_tokens  = log(tokens),
+    log_freq        = log1p(corpus_freq),   # log1p handles any zero-count binomials
+    log_tokens      = log(tokens),
+    # Zero-corpus binomials get rel_freq = 0.5 (no ordering evidence either way)
+    corpus_rel_freq = if_else(is.na(corpus_rel_freq), 0.5, corpus_rel_freq),
     # Negate self_sim so higher = more consistent (easier to interpret)
     consistency = -self_sim_AB,
     model_size  = factor(model_size, levels = c("125m", "350m", "1.3b"))
@@ -102,20 +105,54 @@ ggplot(df_final, aes(x = consistency, y = procrustes_dist, colour = model_size))
   theme_minimal()
 ```
 
-### Procrustes distance vs overall frequency at final checkpoint
+### Procrustes distance vs overall frequency across checkpoints
 
-```{r viz-freq, fig.height=4}
-ggplot(df_final, aes(x = log_freq, y = procrustes_dist, colour = model_size)) +
+```{r viz-freq, fig.height=9}
+df_labeled %>%
+  filter(!is.na(ckpt_label), corpus_freq > 0) %>%
+  mutate(ckpt_label = factor(ckpt_label, levels = c("early", "mid", "final"))) %>%
+  ggplot(aes(x = log_freq, y = procrustes_dist, colour = model_size)) +
   geom_point(alpha = 0.25, size = 0.8) +
   geom_smooth(method = "lm", se = TRUE) +
-  facet_wrap(~model_size) +
+  facet_grid(ckpt_label ~ model_size) +
   scale_colour_brewer(palette = "Set1", guide = "none") +
   labs(
     x     = "log(overall frequency)",
     y     = "Procrustes distance",
-    title = "Procrustes distance vs corpus frequency (final checkpoint, last layer)"
+    title = "Procrustes distance vs corpus frequency (last layer)"
   ) +
   theme_minimal()
+```
+
+### Interaction of overall frequency × relative frequency on Procrustes distance
+
+Binomials split into high/low relative frequency (median split within each model),
+then Procrustes distance plotted against log overall frequency.
+High rel_freq = AB order dominant; low rel_freq = BA order dominant.
+
+```{r viz-freq-relfreq-interaction, fig.height=9}
+df_labeled %>%
+  filter(!is.na(ckpt_label), corpus_freq > 0, !is.na(corpus_rel_freq)) %>%
+  mutate(
+    ckpt_label = factor(ckpt_label, levels = c("early", "mid", "final")),
+    rel_freq_group = if_else(corpus_rel_freq >= 0.5, "AB-dominant (rel_freq ≥ 0.5)",
+                                                      "BA-dominant (rel_freq < 0.5)")
+  ) %>%
+  ggplot(aes(x = log_freq, y = procrustes_dist,
+             colour = rel_freq_group, fill = rel_freq_group)) +
+  geom_point(alpha = 0.2, size = 0.8) +
+  geom_smooth(method = "lm", se = TRUE) +
+  facet_grid(ckpt_label ~ model_size) +
+  scale_colour_brewer(palette = "Set2", aesthetics = c("colour", "fill")) +
+  labs(
+    x      = "log(overall frequency)",
+    y      = "Procrustes distance",
+    colour = "Ordering preference",
+    fill   = "Ordering preference",
+    title  = "Procrustes distance: overall freq × relative freq interaction (last layer)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
 ```
 
 ### Predictor correlation: consistency vs frequency

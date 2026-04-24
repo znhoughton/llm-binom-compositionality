@@ -103,7 +103,7 @@ MODEL_CONFIGS = {
         "job_weight":      3.5,
     },
     "znhoughton/opt-babylm-1.3b-20eps-seed964": {
-        "tokens_per_step": 1_024_000,
+        "tokens_per_step": 409_600,
         "tokenizer":       "znhoughton/opt-babylm-1.3b-20eps-seed964",
         "size_label":      "1.3b",
         "batch_size":      2048,  # start high; OOM fallback will halve if needed
@@ -236,18 +236,36 @@ def _save_sentence_pool(pool: Dict[str, List[str]], path: str):
                 writer.writerow({"phrase": phrase, "sentence": sent})
 
 
+def _swap_phrase(sentence: str, phrase_ab: str, phrase_ba: str) -> str:
+    """
+    Replace phrase_ab with phrase_ba in sentence, preserving the capitalisation
+    of the first character (handles sentence-initial occurrences).
+    """
+    import re
+    def _repl(match: re.Match) -> str:
+        orig = match.group(0)
+        result = phrase_ba
+        if orig[0].isupper():
+            result = result[0].upper() + result[1:]
+        return result
+    return re.sub(re.escape(phrase_ab), _repl, sentence, flags=re.IGNORECASE)
+
+
 def _generate_for_pair(
     phrase_ab: str,
     phrase_ba: str,
     n: int,
     client,
 ) -> Tuple[List[str], List[str]]:
+    """
+    Generate n sentences containing phrase_ab, then derive the matched BA
+    sentences by swapping the phrase in-place.  Both orderings therefore
+    share identical sentence contexts — the only difference is word order.
+    """
     n_request = min(n + REQUEST_BUFFER, MAX_PER_REQUEST)
     prompt = (
         f'Write exactly {n_request} natural English sentences that each contain '
-        f'the exact phrase "{phrase_ab}", then exactly {n_request} sentences that '
-        f'each contain "{phrase_ba}".\n\n'
-        f'Separate the two groups with a line containing only "---".\n'
+        f'the exact phrase "{phrase_ab}".\n\n'
         f'Output one sentence per line. No numbering, bullets, or labels. '
         f'Each sentence should be 10-30 words and use the phrase naturally in '
         f'varied contexts.'
@@ -268,15 +286,9 @@ def _generate_for_pair(
             else:
                 raise
 
-    text  = resp.content[0].text.strip()
-    parts = text.split("---", 1)
-
-    def parse_block(block: str, phrase: str) -> List[str]:
-        lines = [l.strip() for l in block.strip().splitlines() if l.strip()]
-        return [l for l in lines if phrase.lower() in l.lower()]
-
-    sents_ab = parse_block(parts[0], phrase_ab)[:n]
-    sents_ba = parse_block(parts[1] if len(parts) > 1 else "", phrase_ba)[:n]
+    lines = [l.strip() for l in resp.content[0].text.strip().splitlines() if l.strip()]
+    sents_ab = [l for l in lines if phrase_ab.lower() in l.lower()][:n]
+    sents_ba = [_swap_phrase(s, phrase_ab, phrase_ba) for s in sents_ab]
     return sents_ab, sents_ba
 
 
@@ -285,18 +297,25 @@ def collect_sentences(
     max_per_ordering: int = MAX_SENTENCES_PER_ORDERING,
 ) -> Dict[str, List[str]]:
     """
-    Generate up to `max_per_ordering` sentences for every (AB, BA) ordering
-    using the Claude API. Resume-safe via SENTENCE_POOL_CSV.
-    Returns {phrase_string: [sentence, ...]}
+    Generate up to `max_per_ordering` sentences for the AB ordering of every
+    binomial via the Claude API, then derive BA sentences by swapping the
+    phrase in-place.  This ensures AB and BA are embedded in identical
+    sentence contexts — the only difference is word order.
+
+    The pool stores AB sentences only; BA sentences are always re-derived on
+    the fly so stale independently-generated BA entries are never used.
+    Resume-safe via SENTENCE_POOL_CSV.
+    Returns {phrase_string: [sentence, ...]} for both AB and BA.
     """
     pool = _load_sentence_pool(SENTENCE_POOL_CSV)
 
     pairs = [(row["phrase_AB"], row["phrase_BA"])
              for _, row in binoms_df.iterrows()]
+
+    # Only AB needs to reach the target count; BA is derived.
     remaining = [
         (ab, ba) for ab, ba in pairs
         if len(pool.get(ab, [])) < max_per_ordering
-        or len(pool.get(ba, [])) < max_per_ordering
     ]
 
     print(f"\nGenerating sentences for {len(binoms_df)} binomials via Claude API ...")
@@ -311,24 +330,19 @@ def collect_sentences(
         def process_pair(phrase_ab, phrase_ba):
             with pool_lock:
                 sents_ab = list(pool.get(phrase_ab, []))
-                sents_ba = list(pool.get(phrase_ba, []))
 
-            while len(sents_ab) < max_per_ordering or len(sents_ba) < max_per_ordering:
-                needed = max(max_per_ordering - len(sents_ab),
-                             max_per_ordering - len(sents_ba))
-                chunk  = min(needed + REQUEST_BUFFER, MAX_PER_REQUEST)
+            while len(sents_ab) < max_per_ordering:
+                chunk = min(max_per_ordering - len(sents_ab) + REQUEST_BUFFER,
+                            MAX_PER_REQUEST)
                 try:
-                    new_ab, new_ba = _generate_for_pair(
-                        phrase_ab, phrase_ba, chunk, client)
+                    new_ab, _ = _generate_for_pair(phrase_ab, phrase_ba, chunk, client)
                 except Exception as e:
                     tqdm.write(f"  [ERROR] {phrase_ab}: {e}")
                     break
                 sents_ab = list(dict.fromkeys(sents_ab + new_ab))[:max_per_ordering]
-                sents_ba = list(dict.fromkeys(sents_ba + new_ba))[:max_per_ordering]
 
             with pool_lock:
                 pool[phrase_ab] = sents_ab
-                pool[phrase_ba] = sents_ba
                 _save_sentence_pool(pool, SENTENCE_POOL_CSV)
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -339,20 +353,26 @@ def collect_sentences(
                     fut.result()
                     pbar.update(1)
 
-        print(f"  Saved sentence pool → {SENTENCE_POOL_CSV}")
+        print(f"  Saved sentence pool -> {SENTENCE_POOL_CSV}")
 
-    below = [(p, len(pool.get(p, [])))
-             for ab, ba in pairs
-             for p in (ab, ba)
-             if len(pool.get(p, [])) < MIN_SENTENCES_SOFT_WARN]
+    # Derive BA sentences from AB for every pair.
+    result: Dict[str, List[str]] = {}
+    for ab, ba in pairs:
+        sents_ab = pool.get(ab, [])
+        result[ab] = sents_ab
+        result[ba] = [_swap_phrase(s, ab, ba) for s in sents_ab]
+
+    below = [(p, len(result.get(p, [])))
+             for ab, _ in pairs for p in (ab,)
+             if len(result.get(p, [])) < MIN_SENTENCES_SOFT_WARN]
     if below:
-        print(f"\n⚠️  Orderings with fewer than {MIN_SENTENCES_SOFT_WARN} sentences:")
+        print(f"\n  Orderings with fewer than {MIN_SENTENCES_SOFT_WARN} sentences:")
         for phrase, n in sorted(below, key=lambda x: x[1]):
             print(f"    {phrase!r:45s}: {n}")
     else:
-        print(f"  All orderings reached {MAX_SENTENCES_PER_ORDERING} sentences.")
+        print(f"  All orderings reached {max_per_ordering} sentences.")
 
-    return {p: pool.get(p, []) for ab, ba in pairs for p in (ab, ba)}
+    return result
 
 # ---------------------------------------------------------------------------
 # REPRESENTATION EXTRACTION

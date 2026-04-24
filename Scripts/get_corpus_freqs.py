@@ -113,7 +113,7 @@ def main():
 
     out_df = pd.DataFrame(rows).sort_values("phrase_AB")
     out_df.to_csv(OUT_CSV, index=False)
-    print(f"\nSaved → {OUT_CSV}")
+    print(f"\nSaved -> {OUT_CSV}")
 
     # Summary
     n_zero = (out_df["overall_freq"] == 0).sum()

@@ -156,9 +156,18 @@ simultaneously.
 
 Orthogonal Procrustes asks: **can you rotate the AB cloud to match the BA cloud?**
 
-Formally, find the orthogonal matrix R* (rotation / reflection) that minimises:
+Before the rotation is computed, each cloud is **mean-centred**:
 
-$$R^* = \arg\min_{R^\top R = I} \|AR - B\|_F$$
+$$A_c = A - \mu_A, \quad B_c = B - \mu_B \quad \text{where } \mu_A = \frac{1}{n}\sum_i a_i,\; \mu_B = \frac{1}{n}\sum_i b_i$$
+
+Centering removes any translation offset between the two clouds, so the
+Procrustes residual reflects purely geometric shape differences rather than
+differences in mean position in representation space.  (Whether the mean
+vectors $\mu_A$ and $\mu_B$ differ is a separate, independent question.)
+
+We then find the orthogonal matrix R* (rotation / reflection) that minimises:
+
+$$R^* = \arg\min_{R^\top R = I} \|A_c R - B_c\|_F$$
 
 A small residual means the two orderings live in geometrically aligned
 subspaces — the model has learned a representation that is "rotation-equivalent"
@@ -166,56 +175,56 @@ across orderings.
 
 ### 4.2 The optimal rotation
 
-Take the **SVD of AᵀB**:
+Take the **SVD of $A_c^\top B_c$**:
 
-$$A^\top B = U S V^\top \quad (U, V \text{ orthogonal},\ S = \text{diag}(\sigma_i))$$
+$$A_c^\top B_c = U S V^\top \quad (U, V \text{ orthogonal},\ S = \text{diag}(\sigma_i))$$
 
 The optimal rotation is $R^* = UV^\top$.
 
-**Why?** We want to maximise $\text{tr}(B^\top A R)$ (which minimises the
-residual).  Setting $M = B^\top A = V S U^\top$ and $Q = U^\top R V$ (orthogonal):
+**Why?** We want to maximise $\text{tr}(B_c^\top A_c R)$ (which minimises the
+residual).  Setting $M = B_c^\top A_c = V S U^\top$ and $Q = U^\top R V$ (orthogonal):
 
 $$\text{tr}(MR) = \text{tr}(VSU^\top R) = \text{tr}(S \cdot U^\top R V) = \text{tr}(SQ)$$
 
-This is maximised when Q = I, i.e. $R = UV^\top$, giving maximum value $\sum_i \sigma_i(A^\top B)$.
+This is maximised when Q = I, i.e. $R = UV^\top$, giving maximum value $\sum_i \sigma_i(A_c^\top B_c)$.
 
 ### 4.3 Residual without forming R*
 
-Expand $\|AR^* - B\|_F^2$:
+Expand $\|A_c R^* - B_c\|_F^2$:
 
-$$\|AR^* - B\|_F^2 = \text{tr}(R^{*\top} A^\top A R^*) - 2\,\text{tr}(R^{*\top} A^\top B) + \text{tr}(B^\top B)$$
+$$\|A_c R^* - B_c\|_F^2 = \text{tr}(R^{*\top} A_c^\top A_c R^*) - 2\,\text{tr}(R^{*\top} A_c^\top B_c) + \text{tr}(B_c^\top B_c)$$
 
-Since $R^*$ is orthogonal, $\text{tr}(R^{*\top} A^\top A R^*) = \text{tr}(A^\top A) = \|A\|_F^2$.
+Since $R^*$ is orthogonal, $\text{tr}(R^{*\top} A_c^\top A_c R^*) = \text{tr}(A_c^\top A_c) = \|A_c\|_F^2$.
 
-At $R^* = UV^\top$ and $A^\top B = USV^\top$:
+At $R^* = UV^\top$ and $A_c^\top B_c = USV^\top$:
 
-$$\text{tr}(R^{*\top} A^\top B) = \text{tr}(VU^\top \cdot USV^\top) = \text{tr}(VSV^\top) = \text{tr}(S) = \sum_i \sigma_i(A^\top B)$$
+$$\text{tr}(R^{*\top} A_c^\top B_c) = \text{tr}(VU^\top \cdot USV^\top) = \text{tr}(VSV^\top) = \text{tr}(S) = \sum_i \sigma_i(A_c^\top B_c)$$
 
 Therefore:
 
-$$\boxed{\|AR^* - B\|_F^2 = \|A\|_F^2 + \|B\|_F^2 - 2\sum_i \sigma_i(A^\top B)}$$
+$$\boxed{\|A_c R^* - B_c\|_F^2 = \|A_c\|_F^2 + \|B_c\|_F^2 - 2\sum_i \sigma_i(A_c^\top B_c)}$$
 
-**We only need the singular values of AᵀB** — never construct R* or compute AR*−B.
+**We only need the singular values of $A_c^\top B_c$** — never construct R* or compute $A_c R^* - B_c$.
 
 ### 4.4 Thin-factorisation shortcut (avoids D×D matrices)
 
-**The problem:** A and B are (n, D) with n=500, D=2048 for the 1.3 B model.
-Computing AᵀB directly gives a (D, D) = (2048, 2048) matrix per binomial.
+**The problem:** $A_c$ and $B_c$ are (n, D) with n=500, D=2048 for the 1.3 B model.
+Computing $A_c^\top B_c$ directly gives a (D, D) = (2048, 2048) matrix per binomial.
 With N=594 binomials batched, that's a (594, 2048, 2048) tensor ≈ 10 GB.
 SVD of each 2048×2048 matrix costs O(D³) ≈ 8.6 × 10⁹ flops.
 
-**The trick:** Use A's **thin SVD**:
+**The trick:** Use $A_c$'s **thin SVD**:
 
-$$A = U_A \,\text{diag}(S_A)\, V_A^\top$$
+$$A_c = U_A \,\text{diag}(S_A)\, V_A^\top$$
 
 where $U_A$ is $n \times n$, $S_A \in \mathbb{R}^n$, $V_A$ is $D \times n$, and
 $V_A^\top V_A = I_n$ (V_A has **orthonormal columns**).
 
 Then:
 
-$$A^\top B = V_A \,\text{diag}(S_A)\, U_A^\top B = V_A C, \quad C = \text{diag}(S_A)(U_A^\top B)$$
+$$A_c^\top B_c = V_A \,\text{diag}(S_A)\, U_A^\top B_c = V_A C, \quad C = \text{diag}(S_A)(U_A^\top B_c)$$
 
-C has shape $n \times D$ — the same as A and B.
+C has shape $n \times D$ — the same as $A_c$ and $B_c$.
 
 **Key lemma: left-multiplying by $V_A$ does not change singular values.**
 
@@ -227,51 +236,55 @@ The non-zero eigenvalues of $V_A(CC^\top V_A^\top)$ equal those of
 $(CC^\top V_A^\top)V_A = CC^\top (V_A^\top V_A) = CC^\top$
 (using $V_A^\top V_A = I_n$).
 
-$$\Rightarrow\quad \sigma_i^2(V_A C) = \sigma_i^2(C) \quad\Rightarrow\quad \sigma_i(A^\top B) = \sigma_i(C)$$
+$$\Rightarrow\quad \sigma_i^2(V_A C) = \sigma_i^2(C) \quad\Rightarrow\quad \sigma_i(A_c^\top B_c) = \sigma_i(C)$$
 
-So we can replace SVD of the (D, D) matrix AᵀB with SVD of the (n, D) matrix C.
+So we can replace SVD of the (D, D) matrix $A_c^\top B_c$ with SVD of the (n, D) matrix C.
 
 **Cost comparison for 1.3 B (D=2048, n=500):**
 
 | Step | Old | New |
 |---|---|---|
-| Form AᵀB | O(nD²) per binomial | avoided |
-| SVD | O(D³) = O(D³) | O(n²D) via svdvals(C) |
+| Form $A_c^\top B_c$ | O(nD²) per binomial | avoided |
+| SVD | O(D³) | O(n²D) via svdvals(C) |
 | Savings | — | ~D/n ≈ **17×** |
 
 ### 4.5 Obtaining U_A and S_A without a full SVD
 
-We need U_A (left singular vectors) and S_A (singular values) of A.
-Rather than running a full SVD, we compute the **eigendecomposition of AAᵀ**:
+We need U_A (left singular vectors) and S_A (singular values) of $A_c$.
+Rather than running a full SVD, we compute the **eigendecomposition of $A_c A_c^\top$**:
 
-$$AA^\top = U_A \,\text{diag}(S_A^2)\, U_A^\top$$
+$$A_c A_c^\top = U_A \,\text{diag}(S_A^2)\, U_A^\top$$
 
-Since AAᵀ is symmetric positive semi-definite, `torch.linalg.eigh` gives exact
+Since $A_c A_c^\top$ is symmetric positive semi-definite, `torch.linalg.eigh` gives exact
 eigenvalues in ascending order.  Then $S_A = \sqrt{\text{eigenvalues}}$.
 
-Bonus: $\|A\|_F^2 = \text{tr}(AA^\top) = \sum_i \lambda_i(AA^\top)$, so we can
-read off $\|A\|_F^2$ directly from the eigenvalues L_A.
+Bonus: $\|A_c\|_F^2 = \text{tr}(A_c A_c^\top) = \sum_i \lambda_i(A_c A_c^\top)$, so we can
+read off $\|A_c\|_F^2$ directly from the eigenvalues L_A.
 
 ### 4.6 Code
 
 ```python
-# Step 1 — eigh gives U_A (left sing. vecs) and L_A = S_A² (eigenvalues of AAᵀ)
+# Centre each cloud (remove mean position before measuring shape alignment)
+A = A - A.mean(dim=1, keepdim=True)            # (N, n, D)  A_c
+B = B - B.mean(dim=1, keepdim=True)            # (N, n, D)  B_c
+
+# Step 1 — eigh gives U_A (left sing. vecs) and L_A = S_A² (eigenvalues of A_c A_cᵀ)
 AAT       = torch.bmm(A, A.transpose(1, 2))    # (N, n, n)
 L_A, U_A  = torch.linalg.eigh(AAT)             # ascending eigenvalues, eigenvectors
 
-# Reuse eigenvalues for ||A||_F² and S_A
-norm_A_sq = L_A.clamp(min=0).sum(dim=1)        # ||A||_F² = Σ eigenvalues
-norm_B_sq = B.pow(2).sum(dim=(1, 2))           # ||B||_F²
-S_A       = L_A.clamp(min=0).sqrt()            # (N, n) singular values of A
+# Reuse eigenvalues for ||A_c||_F² and S_A
+norm_A_sq = L_A.clamp(min=0).sum(dim=1)        # ||A_c||_F² = Σ eigenvalues
+norm_B_sq = B.pow(2).sum(dim=(1, 2))           # ||B_c||_F²
+S_A       = L_A.clamp(min=0).sqrt()            # (N, n) singular values of A_c
 
-# Step 2 — form C = diag(S_A) U_Aᵀ B  (N, n, D)
+# Step 2 — form C = diag(S_A) U_Aᵀ B_c  (N, n, D)
 C = S_A.unsqueeze(-1) * torch.bmm(U_A.transpose(1, 2), B)
 
-# Step 3 — sum of singular values of AᵀB = sum of singular values of C
-S        = torch.linalg.svdvals(C)             # (N, n)
+# Step 3 — sum of singular values of A_cᵀ B_c = sum of singular values of C
+S        = torch.linalg.svd(C, full_matrices=False, driver='gesvd').S  # (N, n)
 resid_sq = (norm_A_sq + norm_B_sq - 2.0 * S.sum(dim=1)).clamp(min=0.0)
 
-# Step 4 — normalise residual by ||B||_F
+# Step 4 — normalise residual by ||B_c||_F
 proc = resid_sq.sqrt() / norm_B_sq.sqrt().clamp(min=1e-10)
 ```
 
@@ -284,9 +297,9 @@ cancellation producing a tiny negative value before the square root.
 
 The reported `procrustes_dist` is:
 
-$$\text{procrustes\_dist} = \frac{\|AR^* - B\|_F}{\|B\|_F}$$
+$$\text{procrustes\_dist} = \frac{\|A_c R^* - B_c\|_F}{\|B_c\|_F}$$
 
-This normalises by the scale of B so scores are comparable across layers and
+This normalises by the scale of $B_c$ so scores are comparable across layers and
 model sizes where hidden norms may differ.
 
 ---
@@ -345,7 +358,10 @@ model's layer count ahead of time.
 | `self_sim_AB` | $-\|X_c^{AB}\|_F^2 / (n(n-1))$ | Consistent AB reps | Context-dependent AB reps |
 | `self_sim_BA` | $-\|X_c^{BA}\|_F^2 / (n(n-1))$ | Consistent BA reps | Context-dependent BA reps |
 | `self_sim_ratio` | `self_sim_AB / self_sim_BA` | AB more consistent than BA | BA more consistent than AB |
-| `procrustes_dist` | $\|AR^*-B\|_F / \|B\|_F$ | Poor geometric alignment | Good geometric alignment |
+| `procrustes_dist` | $\|A_c R^*-B_c\|_F / \|B_c\|_F$ | Poor geometric alignment | Good geometric alignment |
 
 Note: self-similarity scores are ≤ 0 (they are negative squared norms divided
 by a positive constant).  "Higher" means closer to 0, i.e. less spread.
+
+$A_c$ and $B_c$ denote the mean-centred AB and BA representation matrices
+(each row shifted by its cloud's mean vector before the Procrustes step).

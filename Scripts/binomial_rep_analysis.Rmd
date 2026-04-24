@@ -71,8 +71,8 @@ checkpoint_labels <- df %>%
   group_by(model_size) %>%
   arrange(step) %>%
   mutate(ckpt_label = case_when(
+    row_number() == n()            ~ "final",   # final first: wins when n()==1
     row_number() == 1              ~ "early",
-    row_number() == n()            ~ "final",
     row_number() == round(n() / 2) ~ "mid",
     TRUE                           ~ NA_character_
   )) %>%
@@ -234,6 +234,112 @@ df_final %>%
   ) +
   theme_minimal() +
   theme(legend.position = "bottom")
+```
+
+## Rotation Cost
+
+`rotation_cost` = ||R* − I||_F measures how far the optimal rotation deviates from
+the identity.  Combined with `procrustes_dist` (residual after rotation) it gives a
+fuller picture:
+
+- **Low dist + low rotation** → clouds nearly identical
+- **Low dist + high rotation** → same shape, systematically rotated
+- **High dist + low rotation** → different shapes, similar orientation
+- **High dist + high rotation** → differ in both shape and orientation
+
+### Rotation cost vs corpus frequency
+
+```{r viz-rot-freq, fig.height=4}
+df_final %>%
+  filter(corpus_freq > 0) %>%
+  ggplot(aes(x = log_freq, y = rotation_cost, colour = model_size)) +
+  geom_point(alpha = 0.25, size = 0.8) +
+  geom_smooth(method = "lm", se = TRUE) +
+  facet_wrap(~model_size, scales = "free") +
+  scale_colour_brewer(palette = "Set1", guide = "none") +
+  labs(
+    x     = "log(overall frequency)",
+    y     = "Rotation cost (||R* − I||_F)",
+    title = "Rotation cost vs corpus frequency (final checkpoint, last layer)"
+  ) +
+  theme_minimal()
+```
+
+### Procrustes distance vs rotation cost
+
+Scatter of the two dimensions together. Points in the lower-right quadrant
+(low Procrustes, high rotation) are the most theoretically interesting: same
+geometric structure, but ordering systematically changes the cloud's orientation.
+
+```{r viz-proc-vs-rot, fig.height=4}
+df_final %>%
+  ggplot(aes(x = rotation_cost, y = procrustes_dist, colour = model_size)) +
+  geom_point(alpha = 0.25, size = 0.8) +
+  geom_smooth(method = "lm", se = TRUE) +
+  facet_wrap(~model_size, scales = "free") +
+  scale_colour_brewer(palette = "Set1", guide = "none") +
+  labs(
+    x     = "Rotation cost (||R* − I||_F)",
+    y     = "Procrustes distance",
+    title = "Procrustes distance vs rotation cost (final checkpoint, last layer)"
+  ) +
+  theme_minimal()
+```
+
+### Frequency × rotation cost coloured by frequency quartile
+
+```{r viz-rot-freq-quartile, fig.height=5}
+df_final %>%
+  filter(corpus_freq > 0) %>%
+  group_by(model_size) %>%
+  mutate(
+    freq_quartile = ntile(corpus_freq, 4),
+    freq_label    = factor(
+      case_when(
+        freq_quartile == 1 ~ "Q1 (low)",
+        freq_quartile == 2 ~ "Q2",
+        freq_quartile == 3 ~ "Q3",
+        freq_quartile == 4 ~ "Q4 (high)"
+      ),
+      levels = c("Q1 (low)", "Q2", "Q3", "Q4 (high)")
+    )
+  ) %>%
+  ungroup() %>%
+  ggplot(aes(x = log_freq, y = rotation_cost, colour = freq_label)) +
+  geom_point(alpha = 0.2, size = 0.8) +
+  geom_smooth(method = "lm", se = TRUE) +
+  facet_wrap(~model_size, scales = "free") +
+  scale_colour_viridis_d(option = "plasma", end = 0.85) +
+  labs(
+    x      = "log(overall frequency)",
+    y      = "Rotation cost (||R* − I||_F)",
+    colour = "Frequency quartile",
+    title  = "Rotation cost vs frequency by frequency quartile (final checkpoint, last layer)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+### Partial residual: frequency effect on rotation cost after consistency
+
+```{r viz-rot-partial-resid, fig.height=4}
+df_final %>%
+  filter(corpus_freq > 0) %>%
+  group_by(model_size) %>%
+  mutate(rot_resid = residuals(lm(rotation_cost ~ mean_consistency))) %>%
+  ungroup() %>%
+  ggplot(aes(x = log_freq, y = rot_resid, colour = model_size)) +
+  geom_point(alpha = 0.25, size = 0.8) +
+  geom_smooth(method = "lm", se = TRUE) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  facet_wrap(~model_size, scales = "free_y") +
+  scale_colour_brewer(palette = "Set1", guide = "none") +
+  labs(
+    x     = "log(overall frequency)",
+    y     = "Rotation cost residual (consistency removed)",
+    title = "Frequency effect on rotation cost after partialling out consistency (final checkpoint)"
+  ) +
+  theme_minimal()
 ```
 
 ### Effect of frequency on Procrustes distance across layers

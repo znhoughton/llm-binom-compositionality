@@ -133,7 +133,9 @@ def find_phrase_span_in_tokens(
     for i, (cs, ce) in enumerate(offset_mapping):
         if cs == ce:  # special token
             continue
-        if tok_start is None and cs >= char_start:
+        # Use ce > char_start (not cs >= char_start) so that BPE tokens that
+        # include a preceding space (cs = char_start - 1) are not skipped.
+        if tok_start is None and ce > char_start:
             tok_start = i
         if tok_start is not None and ce <= char_end:
             tok_end = i

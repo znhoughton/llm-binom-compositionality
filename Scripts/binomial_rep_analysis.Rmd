@@ -59,7 +59,9 @@ df <- df_raw %>%
     # Zero-corpus binomials get rel_freq = 0.5 (no ordering evidence either way)
     corpus_rel_freq = if_else(is.na(corpus_rel_freq), 0.5, corpus_rel_freq),
     # Negate self_sim so higher = more consistent (easier to interpret)
-    consistency = -self_sim_AB,
+    consistency      = -self_sim_AB,
+    consistency_BA   = -self_sim_BA,
+    mean_consistency = (consistency + consistency_BA) / 2,
     model_size  = factor(model_size, levels = c("125m", "350m", "1.3b"))
   )
 
@@ -167,6 +169,32 @@ ggplot(df_final, aes(x = log_freq, y = consistency, colour = model_size)) +
     x = "log(overall frequency)",
     y = "Consistency (−self_sim_AB)",
     title = "Predictor correlation: consistency vs frequency"
+  ) +
+  theme_minimal()
+```
+
+### Procrustes distance vs frequency (mean consistency partialled out)
+
+Residualises `procrustes_dist` on `mean_consistency` (average of AB and BA
+self-similarity) within each model, then plots the residuals against log
+frequency. A negative slope here means the frequency effect survives after
+controlling for both cloud's representational stability.
+
+```{r viz-partial-resid, fig.height=4}
+df_final %>%
+  filter(corpus_freq > 0) %>%
+  group_by(model_size) %>%
+  mutate(proc_resid = residuals(lm(procrustes_dist ~ mean_consistency))) %>%
+  ungroup() %>%
+  ggplot(aes(x = log_freq, y = proc_resid, colour = model_size)) +
+  geom_point(alpha = 0.25, size = 0.8) +
+  geom_smooth(method = "lm", se = TRUE) +
+  facet_wrap(~model_size, scales = "free_x") +
+  scale_colour_brewer(palette = "Set1", guide = "none") +
+  labs(
+    x     = "log(overall frequency)",
+    y     = "Procrustes distance (residual after mean consistency)",
+    title = "Procrustes distance vs frequency, mean consistency partialled out (final checkpoint, last layer)"
   ) +
   theme_minimal()
 ```
@@ -359,7 +387,7 @@ df %>%
 All models are fit separately per LLM (125m, 350m, 1.3b).
 
 Outcome: `procrustes_dist`.
-Predictors: `consistency` (−self_sim_AB) and `log_freq`, both scaled within each model fit.
+Predictors: `mean_consistency` (average of −self_sim_AB and −self_sim_BA) and `log_freq`, both scaled within each model fit.
 Random effect: `(1 | phrase_AB)`.
 Family: Gaussian (beta regression would be more principled for a 0–1 outcome but is a reasonable starting point).
 
@@ -386,7 +414,7 @@ fit_ckpt_models <- function(size) {
   map(c("early", "mid", "final"), function(label) {
     d <- df_labeled %>%
       filter(model_size == size, ckpt_label == label) %>%
-      mutate(cons_sc = as.vector(scale(consistency)),
+      mutate(cons_sc = as.vector(scale(mean_consistency)),
              freq_sc = as.vector(scale(log_freq)))
 
     brm(
@@ -450,7 +478,7 @@ formula_full <- procrustes_dist ~ cons_sc * freq_sc * log_tokens_sc + (1 | phras
 fit_full_model <- function(size) {
   d <- df %>%
     filter(model_size == size) %>%
-    mutate(cons_sc       = as.vector(scale(consistency)),
+    mutate(cons_sc       = as.vector(scale(mean_consistency)),
            freq_sc       = as.vector(scale(log_freq)),
            log_tokens_sc = as.vector(scale(log_tokens)))
 

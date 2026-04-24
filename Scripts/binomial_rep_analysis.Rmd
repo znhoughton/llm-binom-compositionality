@@ -199,6 +199,67 @@ df_final %>%
   theme_minimal()
 ```
 
+### Frequency effect from joint OLS model (mean consistency held constant)
+
+Fits `lm(procrustes_dist ~ cons_c + freq_c)` separately per model size with
+both predictors mean-centred. The regression line shows predicted Procrustes
+distance across the observed frequency range at mean consistency (`cons_c = 0`),
+so the slope is mathematically the frequency effect holding consistency constant.
+Points are partial residuals that remove the fitted consistency contribution, so
+their scatter aligns with the line.
+
+```{r viz-freq-lm-adjusted, fig.height=4}
+models_adj <- df_final %>%
+  filter(corpus_freq > 0) %>%
+  group_by(model_size) %>%
+  nest() %>%
+  mutate(
+    data_c = map(data, ~ .x %>% mutate(
+      cons_c = mean_consistency - mean(mean_consistency),
+      freq_c = log_freq         - mean(log_freq)
+    )),
+    fit = map(data_c, ~ lm(procrustes_dist ~ cons_c + freq_c, data = .x))
+  )
+
+pred_lines <- models_adj %>%
+  mutate(preds = map2(fit, data_c, ~ {
+    grid <- tibble(freq_c = seq(min(.y$freq_c), max(.y$freq_c), length.out = 200),
+                   cons_c = 0) %>%
+      mutate(log_freq = freq_c + mean(.y$log_freq))
+    bind_cols(grid, as_tibble(predict(.x, newdata = grid, interval = "confidence")))
+  })) %>%
+  select(model_size, preds) %>%
+  unnest(preds)
+
+pts_adj <- models_adj %>%
+  mutate(pts = map2(fit, data_c, ~ {
+    b <- coef(.x)["cons_c"]
+    .y %>% mutate(proc_adj = procrustes_dist - b * cons_c)
+  })) %>%
+  select(model_size, pts) %>%
+  unnest(pts)
+
+ggplot() +
+  geom_point(data = pts_adj,
+             aes(x = log_freq, y = proc_adj, colour = model_size),
+             alpha = 0.2, size = 0.8) +
+  geom_ribbon(data = pred_lines,
+              aes(x = log_freq, ymin = lwr, ymax = upr, fill = model_size),
+              alpha = 0.25) +
+  geom_line(data = pred_lines,
+            aes(x = log_freq, y = fit, colour = model_size),
+            linewidth = 0.9) +
+  facet_wrap(~model_size, scales = "free_x") +
+  scale_colour_brewer(palette = "Set1", guide = "none") +
+  scale_fill_brewer(palette = "Set1", guide = "none") +
+  labs(
+    x     = "log(overall frequency)",
+    y     = "Procrustes distance (partial)",
+    title = "Frequency effect at mean consistency — joint OLS model (final checkpoint, last layer)"
+  ) +
+  theme_minimal()
+```
+
 ### Effect of frequency on Procrustes distance across layers
 
 Spearman correlation between log corpus frequency and Procrustes distance

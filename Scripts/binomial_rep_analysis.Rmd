@@ -245,6 +245,115 @@ ggplot(df_avg, aes(x = log_tokens, y = mean_proc,
   theme_minimal()
 ```
 
+### Procrustes distance across layers
+
+Mean Procrustes distance at each layer for the early, mid, and final checkpoints.
+Shows how word-order sensitivity builds across network depth and whether that
+layer-profile changes over training.
+
+```{r viz-proc-by-layer, fig.height=4}
+df_raw %>%
+  inner_join(checkpoint_labels %>% select(model_size, step, ckpt_label),
+             by = c("model_size", "step")) %>%
+  mutate(
+    model_size = factor(model_size, levels = c("125m", "350m", "1.3b")),
+    ckpt_label = factor(ckpt_label, levels = c("early", "mid", "final"))
+  ) %>%
+  group_by(model_size, ckpt_label, layer) %>%
+  summarise(mean_proc = mean(procrustes_dist), .groups = "drop") %>%
+  ggplot(aes(x = layer, y = mean_proc, colour = ckpt_label)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.5) +
+  facet_wrap(~model_size, scales = "free_x") +
+  scale_colour_brewer(palette = "Set2") +
+  labs(
+    x      = "Layer",
+    y      = "Mean Procrustes distance",
+    title  = "Procrustes distance across layers (early / mid / final checkpoints)",
+    colour = "Checkpoint"
+  ) +
+  theme_minimal()
+```
+
+### Procrustes distance across layers by frequency quartile
+
+Layer profile split by corpus-frequency quartile at the final checkpoint.
+Shows whether the layer at which word-order representations diverge differs
+for high vs low frequency binomials.
+
+```{r viz-proc-layer-freq, fig.height=4}
+df_raw %>%
+  semi_join(
+    checkpoint_labels %>% filter(ckpt_label == "final") %>% select(model_size, step),
+    by = c("model_size", "step")
+  ) %>%
+  filter(corpus_freq > 0) %>%
+  mutate(
+    model_size    = factor(model_size, levels = c("125m", "350m", "1.3b")),
+    freq_quartile = ntile(corpus_freq, 4),
+    freq_label    = factor(
+      case_when(
+        freq_quartile == 1 ~ "Q1 (low freq)",
+        freq_quartile == 2 ~ "Q2",
+        freq_quartile == 3 ~ "Q3",
+        freq_quartile == 4 ~ "Q4 (high freq)"
+      ),
+      levels = c("Q1 (low freq)", "Q2", "Q3", "Q4 (high freq)")
+    )
+  ) %>%
+  group_by(model_size, layer, freq_label) %>%
+  summarise(mean_proc = mean(procrustes_dist), .groups = "drop") %>%
+  ggplot(aes(x = layer, y = mean_proc, colour = freq_label)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.5) +
+  facet_wrap(~model_size, scales = "free_x") +
+  scale_colour_viridis_d(option = "plasma", end = 0.85) +
+  labs(
+    x      = "Layer",
+    y      = "Mean Procrustes distance",
+    title  = "Procrustes distance across layers by frequency quartile (final checkpoint)",
+    colour = "Frequency quartile"
+  ) +
+  theme_minimal()
+```
+
+### Procrustes distance over training by frequency quartile
+
+Training trajectory split by corpus-frequency quartile (last layer).
+Shows whether high-frequency binomials develop more order-sensitive
+representations earlier in training than low-frequency ones.
+
+```{r viz-proc-training-freq, fig.height=4}
+df %>%
+  filter(corpus_freq > 0) %>%
+  mutate(
+    freq_quartile = ntile(corpus_freq, 4),
+    freq_label    = factor(
+      case_when(
+        freq_quartile == 1 ~ "Q1 (low freq)",
+        freq_quartile == 2 ~ "Q2",
+        freq_quartile == 3 ~ "Q3",
+        freq_quartile == 4 ~ "Q4 (high freq)"
+      ),
+      levels = c("Q1 (low freq)", "Q2", "Q3", "Q4 (high freq)")
+    )
+  ) %>%
+  group_by(model_size, log_tokens, freq_label) %>%
+  summarise(mean_proc = mean(procrustes_dist), .groups = "drop") %>%
+  ggplot(aes(x = log_tokens, y = mean_proc, colour = freq_label)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.5) +
+  facet_wrap(~model_size) +
+  scale_colour_viridis_d(option = "plasma", end = 0.85) +
+  labs(
+    x      = "log(tokens seen)",
+    y      = "Mean Procrustes distance",
+    title  = "Procrustes distance over training by frequency quartile (last layer)",
+    colour = "Frequency quartile"
+  ) +
+  theme_minimal()
+```
+
 ## brms Models
 
 All models are fit separately per LLM (125m, 350m, 1.3b).

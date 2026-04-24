@@ -431,6 +431,61 @@ def _batch_self_similarity(X: torch.Tensor) -> torch.Tensor:
     return -X_c.pow(2).sum(dim=(1, 2)) / (n * (n - 1))  # (N,)
 
 
+def _score_layer_pairs(
+    A_arrs: list,
+    B_arrs: list,
+    n: int,
+    device: str,
+) -> Dict[str, np.ndarray]:
+    """
+    Core linalg for one (sub-)batch of binomial pairs on a single layer.
+    A_arrs / B_arrs: lists of (n_sentences, D) numpy arrays.
+    n: number of sentences to use per binomial (already validated >= 2).
+    Returns dict of 1-D numpy arrays, one value per binomial.
+    """
+    A = torch.from_numpy(np.stack([a[:n] for a in A_arrs])).to(device).float()
+    B = torch.from_numpy(np.stack([b[:n] for b in B_arrs])).to(device).float()
+
+    ss_ab = _batch_self_similarity(A)
+    ss_ba = _batch_self_similarity(B)
+
+    A = A - A.mean(dim=1, keepdim=True)
+    B = B - B.mean(dim=1, keepdim=True)
+
+    AAT      = torch.bmm(A, A.transpose(1, 2))
+    L_A, U_A = torch.linalg.eigh(AAT)
+    norm_A_sq = L_A.clamp(min=0).sum(dim=1)
+    norm_B_sq = B.pow(2).sum(dim=(1, 2))
+
+    S_A = L_A.clamp(min=0).sqrt()
+    C   = S_A.unsqueeze(-1) * torch.bmm(U_A.transpose(1, 2), B)
+
+    svd_kw = {"full_matrices": False}
+    if "cuda" in device:
+        svd_kw["driver"] = "gesvd"
+    svd_out        = torch.linalg.svd(C, **svd_kw)
+    U_C, S_C, Vh_C = svd_out.U, svd_out.S, svd_out.Vh
+    sum_sigma      = S_C.sum(dim=1)
+    resid_sq       = (norm_A_sq + norm_B_sq - 2.0 * sum_sigma).clamp(min=0.0)
+    proc           = resid_sq.sqrt() / norm_B_sq.sqrt().clamp(min=1e-10)
+
+    P       = torch.bmm(A, Vh_C.transpose(1, 2))
+    Q       = torch.bmm(U_A.transpose(1, 2), P)
+    M       = Q * (1.0 / S_A.clamp(min=1e-10)).unsqueeze(-1)
+    R_trace = (M * U_C).sum(dim=(1, 2))
+    rot_cost = (2.0 * n - 2.0 * R_trace).clamp(min=0.0).sqrt()
+
+    return {
+        "ss_ab":     ss_ab.cpu().numpy(),
+        "ss_ba":     ss_ba.cpu().numpy(),
+        "proc":      proc.cpu().numpy(),
+        "rot_cost":  rot_cost.cpu().numpy(),
+        "sum_sigma": sum_sigma.cpu().numpy(),
+        "norm_A":    norm_A_sq.sqrt().cpu().numpy(),
+        "norm_B":    norm_B_sq.sqrt().cpu().numpy(),
+    }
+
+
 def compute_scores_batched(
     chunk_reps: Dict[str, Dict[int, np.ndarray]],
     pairs: List[Tuple[str, str]],
@@ -522,11 +577,6 @@ def compute_scores_batched(
 
     scores_by_ab: Dict[str, List[Dict]] = {ab: [] for ab, _ in valid_pairs}
 
-    # Prefer MAGMA over cuSolver for eigh/svd — cuSolver can fail to create its
-    # internal handle under GPU memory pressure (e.g. after an OOM recovery).
-    if "cuda" in device:
-        torch.backends.cuda.preferred_linalg_library("magma")
-
     if layers_filter == "last":
         all_layers = [max(all_layers)] if all_layers else []
     elif layers_filter is not None:
@@ -541,117 +591,55 @@ def compute_scores_batched(
         if not layer_pairs:
             continue
 
-        steps = tqdm(
-            ["stack", "self-sim AB", "self-sim BA", "procrustes eigh",
-             "procrustes svd", "rotation cost", "collect"],
-            desc=f"    layer {layer_idx:>2d}",
-            leave=False,
-            position=1,
-        )
-
-        steps.set_description(f"    layer {layer_idx:>2d}  stack")
         A_arrs = [chunk_reps[ab][layer_idx] for ab, _  in layer_pairs]
         B_arrs = [chunk_reps[ba][layer_idx] for _,  ba in layer_pairs]
         n = min(min(len(a) for a in A_arrs), min(len(b) for b in B_arrs))
         if n < 2:
             tqdm.write(f"  ⚠️  layer {layer_idx}: n={n} < 2, skipping layer (need ≥2 sentences for self-similarity)")
-            steps.close()
             continue
-        A = torch.from_numpy(np.stack([a[:n] for a in A_arrs])).to(device).float()
-        B = torch.from_numpy(np.stack([b[:n] for b in B_arrs])).to(device).float()
-        steps.update(1)
 
-        steps.set_description(f"    layer {layer_idx:>2d}  self-sim AB")
-        ss_ab = _batch_self_similarity(A)
-        if device != "cpu": torch.cuda.synchronize()
-        steps.update(1)
+        # Score all pairs, halving the linalg sub-batch if GPU runs out of memory.
+        sub_bs = len(layer_pairs)
+        layer_results: List[Optional[Dict]] = [None] * len(layer_pairs)
+        while True:
+            try:
+                for start in range(0, len(layer_pairs), sub_bs):
+                    end = min(start + sub_bs, len(layer_pairs))
+                    res = _score_layer_pairs(A_arrs[start:end], B_arrs[start:end], n, device)
+                    for j in range(end - start):
+                        layer_results[start + j] = {k: v[j] for k, v in res.items()}
+                break
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower() and sub_bs > 1:
+                    torch.cuda.empty_cache()
+                    sub_bs = max(1, sub_bs // 2)
+                    layer_results = [None] * len(layer_pairs)
+                    warnings.warn(
+                        f"Scoring OOM on layer {layer_idx} — "
+                        f"reducing linalg sub-batch to {sub_bs}"
+                    )
+                else:
+                    raise
 
-        steps.set_description(f"    layer {layer_idx:>2d}  self-sim BA")
-        ss_ba = _batch_self_similarity(B)
-        if device != "cpu": torch.cuda.synchronize()
-        steps.update(1)
-
-        # ---- Procrustes ----
-        # Goal: ||AR* - B||_F / ||B||_F  where R* is the optimal rotation.
-        #
-        # Shortcut 1 — residual without forming R*:
-        #   ||AR* - B||_F² = ||A||_F² + ||B||_F² - 2·Σ σᵢ(AᵀB)
-        #
-        # Shortcut 2 — thin factorisation to avoid (N, D, D):
-        #   eigh(AAᵀ) → U_A (left singular vectors), L_A (= S_A²)
-        #   C = diag(S_A) · U_Aᵀ B   is (N, n, D)  instead of (N, D, D)
-        #   Σ σᵢ(AᵀB) = Σ σᵢ(C)  because V_A (orthonormal cols) doesn't
-        #   change singular values.
-        #   Also reuse L_A: ||A||_F² = tr(AAᵀ) = Σ eigenvalues.
-        steps.set_description(f"    layer {layer_idx:>2d}  procrustes eigh")
-        A = A - A.mean(dim=1, keepdim=True)            # centre each cloud (remove mean position)
-        B = B - B.mean(dim=1, keepdim=True)
-        AAT       = torch.bmm(A, A.transpose(1, 2))   # (N, n, n) = A Aᵀ
-        L_A, U_A  = torch.linalg.eigh(AAT)            # L_A = S_A², U_A = left singular vecs
-        norm_A_sq = L_A.clamp(min=0).sum(dim=1)       # ||A||_F² = Σ eigenvalues
-        norm_B_sq = B.pow(2).sum(dim=(1, 2))           # ||B||_F²
-        if device != "cpu": torch.cuda.synchronize()
-        steps.update(1)
-
-        steps.set_description(f"    layer {layer_idx:>2d}  procrustes svd")
-        S_A      = L_A.clamp(min=0).sqrt()                              # (N, n) singular values of A
-        C        = S_A.unsqueeze(-1) * torch.bmm(U_A.transpose(1, 2), B)  # (N, n, D): diag(S_A) U_Aᵀ B
-        svd_out        = torch.linalg.svd(C, full_matrices=False, driver='gesvd')
-        U_C, S_C, Vh_C = svd_out.U, svd_out.S, svd_out.Vh    # (N,n,n), (N,n), (N,n,D)
-        sum_sigma      = S_C.sum(dim=1)                        # (N,): Σ σᵢ(AᵀB)
-        resid_sq       = (norm_A_sq + norm_B_sq - 2.0 * sum_sigma).clamp(min=0.0)
-        proc           = resid_sq.sqrt() / norm_B_sq.sqrt().clamp(min=1e-10)
-        if device != "cpu": torch.cuda.synchronize()
-        steps.update(1)
-
-        steps.set_description(f"    layer {layer_idx:>2d}  rotation cost")
-        # Optimal rotation: R* = Vh_C^T U_C^T V_A^T
-        # where V_A^T = diag(1/S_A) U_A^T A_c  (right singular vectors of A_c)
-        #
-        # tr(R*) via cyclic property + trace identity tr(XY) = (X * Y^T).sum():
-        #   tr(R*) = tr(V_A^T Vh_C^T U_C^T) = (M * U_C).sum()
-        #   where M = diag(1/S_A) (U_A^T (A_c Vh_C^T))
-        #
-        # All intermediates are (N, n, n) — the (N, n, D) V_A^T tensor is never formed.
-        #
-        # ||R* - I||_F^2 = 2n - 2·tr(R*)
-        # The D-n inactive dimensions contribute D-n to tr(R*) on both sides and cancel,
-        # so this formula gives the correct full-space Frobenius distance.
-        P        = torch.bmm(A,  Vh_C.transpose(1, 2))               # (N, n, n)
-        Q        = torch.bmm(U_A.transpose(1, 2), P)                  # (N, n, n)
-        M        = Q * (1.0 / S_A.clamp(min=1e-10)).unsqueeze(-1)     # (N, n, n)
-        R_trace  = (M * U_C).sum(dim=(1, 2))                          # (N,): tr(R*)
-        rot_cost = (2.0 * n - 2.0 * R_trace).clamp(min=0.0).sqrt()   # (N,): ||R* - I||_F
-        if device != "cpu": torch.cuda.synchronize()
-        steps.update(1)
-
-        steps.set_description(f"    layer {layer_idx:>2d}  collect")
-        ss_ab_np     = ss_ab.cpu().numpy()
-        ss_ba_np     = ss_ba.cpu().numpy()
-        proc_np      = proc.cpu().numpy()
-        rot_cost_np  = rot_cost.cpu().numpy()
-        sum_sigma_np = sum_sigma.cpu().numpy()
-        norm_A_np    = norm_A_sq.sqrt().cpu().numpy()
-        norm_B_np    = norm_B_sq.sqrt().cpu().numpy()
-        steps.update(1)
-        steps.close()
-
-        for i, (ab, ba) in enumerate(layer_pairs):
-            s_ab  = float(ss_ab_np[i])
-            s_ba  = float(ss_ba_np[i])
+        for i, (ab, _) in enumerate(layer_pairs):
+            r = layer_results[i]
+            if r is None:
+                continue
+            s_ab  = float(r["ss_ab"])
+            s_ba  = float(r["ss_ba"])
             ratio = s_ba / s_ab if (math.isfinite(s_ab) and s_ab != 0.0) else float("nan")
             scores_by_ab[ab].append({
                 "layer":           layer_idx,
                 "n_sentences_AB":  len(A_arrs[i]),
                 "n_sentences_BA":  len(B_arrs[i]),
-                "norm_AB":         float(norm_A_np[i]),
-                "norm_BA":         float(norm_B_np[i]),
-                "sum_sigma":       float(sum_sigma_np[i]),
+                "norm_AB":         float(r["norm_A"]),
+                "norm_BA":         float(r["norm_B"]),
+                "sum_sigma":       float(r["sum_sigma"]),
                 "self_sim_AB":     s_ab,
                 "self_sim_BA":     s_ba,
                 "self_sim_ratio":  ratio,
-                "procrustes_dist": float(proc_np[i]),
-                "rotation_cost":   float(rot_cost_np[i]),
+                "procrustes_dist": float(r["proc"]),
+                "rotation_cost":   float(r["rot_cost"]),
             })
 
     return scores_by_ab
@@ -846,6 +834,8 @@ def _process_checkpoint(
             )
 
             print(f"  Computing scores ...")
+            if "cuda" in device:
+                torch.cuda.empty_cache()
             chunk_pairs = [(r["phrase_AB"], r["phrase_BA"]) for _, r in chunk_df.iterrows()]
             all_scores = compute_scores_batched(chunk_reps, chunk_pairs, device,
                                                 layers_filter=layers_filter)

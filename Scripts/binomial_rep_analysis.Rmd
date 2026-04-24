@@ -24,6 +24,15 @@ library(patchwork)
 ```{r load-data}
 df_raw <- read_csv("../results/binomial_representations.csv")
 
+# Replace web-corpus frequency estimates with counts from the BabyLM training
+# corpus (produced by Scripts/get_corpus_freqs.py).
+corpus_freqs <- read_csv("../Data/babylm_corpus_freqs.csv") %>%
+  select(phrase_AB, corpus_freq = overall_freq, corpus_rel_freq = rel_freq)
+
+df_raw <- df_raw %>%
+  select(-overall_freq, -rel_freq) %>%
+  left_join(corpus_freqs, by = "phrase_AB")
+
 # Each row is one (model × checkpoint × binomial × layer) observation.
 # self_sim_AB is always ≤ 0: closer to 0 = more consistent across contexts.
 # procrustes_dist is normalised residual of Procrustes(AB → BA): lower = better alignment.
@@ -44,7 +53,7 @@ df <- df_raw %>%
   filter(layer == last_layer) %>%
   select(-last_layer) %>%
   mutate(
-    log_freq    = log(overall_freq),
+    log_freq    = log1p(corpus_freq),   # log1p handles any zero-count binomials
     log_tokens  = log(tokens),
     # Negate self_sim so higher = more consistent (easier to interpret)
     consistency = -self_sim_AB,

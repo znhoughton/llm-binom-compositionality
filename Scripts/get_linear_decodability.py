@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+Okay#!/usr/bin/env python3
 """
 get_linear_decodability.py
 --------------------------
@@ -210,17 +210,47 @@ def process_checkpoint(
 # ---------------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------------
+def _checkpoints_from_csv(csv_path: str) -> dict:
+    """
+    Read unique (model, checkpoint, step, tokens) combinations from an existing
+    results CSV (e.g. binomial_representations.csv) and return them as a dict:
+        { model_name: [{"checkpoint": ..., "tag": ..., "step": ..., "tokens": ...}, ...] }
+    This guarantees the decodability run uses exactly the same checkpoints as
+    the Procrustes run, regardless of any new checkpoints added to HuggingFace.
+    """
+    import pandas as pd
+    df = pd.read_csv(csv_path, usecols=["model", "checkpoint", "step", "tokens"])
+    result = {}
+    for model_name, grp in df.drop_duplicates().groupby("model"):
+        result[model_name] = [
+            {"checkpoint": row["checkpoint"],
+             "tag":        row["checkpoint"],
+             "step":       int(row["step"]),
+             "tokens":     int(row["tokens"])}
+            for _, row in grp.iterrows()
+        ]
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Compute linear decodability of binomial ordering from LLM representations."
     )
     parser.add_argument(
         "--n-checkpoints", type=int, default=N_LOG_CHECKPOINTS,
-        help="Number of log-sampled checkpoints (1 = final only, default=%(default)s).",
+        help="Number of log-sampled checkpoints (1 = final only, default=%(default)s). "
+             "Ignored when --checkpoints-from is set.",
     )
     parser.add_argument(
         "--layers", type=str, default="last",
         help="Layers to score: 'all', 'last' (default), or comma-separated indices.",
+    )
+    parser.add_argument(
+        "--checkpoints-from", type=str, default=None,
+        metavar="CSV",
+        help="Read checkpoints from an existing results CSV instead of re-sampling "
+             "(e.g. results/binomial_representations.csv). Guarantees the same "
+             "checkpoint set as the Procrustes run.",
     )
     args = parser.parse_args()
 
@@ -238,12 +268,24 @@ def main():
 
     out_file, writer = open_output(OUT_CSV)
 
+    # Build per-model checkpoint list.
+    if args.checkpoints_from:
+        print(f"\nReading checkpoints from {args.checkpoints_from} ...")
+        ckpts_by_model = _checkpoints_from_csv(args.checkpoints_from)
+    else:
+        ckpts_by_model = None   # will sample below
+
     try:
         for model_name, config in MODEL_CONFIGS.items():
             print(f"\n{'='*60}\nModel: {model_name}\n{'='*60}")
-            tokenizer   = _load_tokenizer(config)
-            checkpoints = get_model_checkpoints(model_name, config["tokens_per_step"])
-            checkpoints = log_sample_checkpoints(checkpoints, args.n_checkpoints)
+            tokenizer = _load_tokenizer(config)
+
+            if ckpts_by_model is not None:
+                checkpoints = ckpts_by_model.get(model_name, [])
+                print(f"  Using {len(checkpoints)} checkpoints from results CSV.")
+            else:
+                checkpoints = get_model_checkpoints(model_name, config["tokens_per_step"])
+                checkpoints = log_sample_checkpoints(checkpoints, args.n_checkpoints)
 
             for ckpt in checkpoints:
                 process_checkpoint(

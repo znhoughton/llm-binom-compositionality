@@ -150,7 +150,7 @@ simultaneously.
 
 ## 4. Orthogonal Procrustes Distance
 
-**File:** `compute_scores_batched`, Procrustes section (line ~625)
+**File:** `_score_layer_pairs` (called from `compute_scores_batched`)
 
 ### 4.1 What it measures
 
@@ -269,8 +269,8 @@ A = A - A.mean(dim=1, keepdim=True)            # (N, n, D)  A_c
 B = B - B.mean(dim=1, keepdim=True)            # (N, n, D)  B_c
 
 # Step 1 — eigh gives U_A (left sing. vecs) and L_A = S_A² (eigenvalues of A_c A_cᵀ)
-AAT       = torch.bmm(A, A.transpose(1, 2))    # (N, n, n)
-L_A, U_A  = torch.linalg.eigh(AAT)             # ascending eigenvalues, eigenvectors
+AAT      = torch.bmm(A, A.transpose(1, 2))     # (N, n, n)
+L_A, U_A = torch.linalg.eigh(AAT)              # ascending eigenvalues, eigenvectors
 
 # Reuse eigenvalues for ||A_c||_F² and S_A
 norm_A_sq = L_A.clamp(min=0).sum(dim=1)        # ||A_c||_F² = Σ eigenvalues
@@ -281,8 +281,13 @@ S_A       = L_A.clamp(min=0).sqrt()            # (N, n) singular values of A_c
 C = S_A.unsqueeze(-1) * torch.bmm(U_A.transpose(1, 2), B)
 
 # Step 3 — sum of singular values of A_cᵀ B_c = sum of singular values of C
-S        = torch.linalg.svd(C, full_matrices=False, driver='gesvd').S  # (N, n)
-resid_sq = (norm_A_sq + norm_B_sq - 2.0 * S.sum(dim=1)).clamp(min=0.0)
+# driver='gesvd' used on CUDA only (not available on CPU)
+svd_kw = {"full_matrices": False}
+if "cuda" in device:
+    svd_kw["driver"] = "gesvd"
+svd_out        = torch.linalg.svd(C, **svd_kw)
+U_C, S_C, Vh_C = svd_out.U, svd_out.S, svd_out.Vh  # needed for rotation cost too
+resid_sq = (norm_A_sq + norm_B_sq - 2.0 * S_C.sum(dim=1)).clamp(min=0.0)
 
 # Step 4 — normalise residual by ||B_c||_F
 proc = resid_sq.sqrt() / norm_B_sq.sqrt().clamp(min=1e-10)
@@ -306,7 +311,7 @@ model sizes where hidden norms may differ.
 
 ## 4b. Rotation Cost
 
-**File:** `compute_scores_batched`, rotation cost section
+**File:** `_score_layer_pairs` (rotation cost section, immediately after Procrustes)
 
 ### 4b.1 Motivation
 
@@ -387,7 +392,7 @@ rot_cost = (2.0 * n - 2.0 * R_trace).clamp(min=0.0).sqrt()
 
 ## 5. Batching Strategy
 
-**File:** `compute_scores_batched` (line ~501)
+**File:** `compute_scores_batched` + `_score_layer_pairs`
 
 ### 5.1 Why batching matters
 

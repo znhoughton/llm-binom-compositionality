@@ -522,6 +522,11 @@ def compute_scores_batched(
 
     scores_by_ab: Dict[str, List[Dict]] = {ab: [] for ab, _ in valid_pairs}
 
+    # Prefer MAGMA over cuSolver for eigh/svd — cuSolver can fail to create its
+    # internal handle under GPU memory pressure (e.g. after an OOM recovery).
+    if "cuda" in device:
+        torch.backends.cuda.preferred_linalg_library("magma")
+
     if layers_filter == "last":
         all_layers = [max(all_layers)] if all_layers else []
     elif layers_filter is not None:

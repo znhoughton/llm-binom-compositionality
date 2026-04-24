@@ -34,6 +34,11 @@ df_raw <- df_raw %>%
   select(-overall_freq, -rel_freq) %>%
   left_join(corpus_freqs, by = "phrase_AB")
 
+# Linear decodability (Scripts/get_linear_decodability.py).
+# decode_accuracy: 10-fold CV logistic regression (PCA → LogReg) accuracy for
+# ordering (AB=0 vs BA=1) from last-layer representations. Chance = 0.5.
+decode_raw <- read_csv("../Data/linear_decodability.csv")
+
 # Each row is one (model × checkpoint × binomial × layer) observation.
 # self_sim_AB is always ≤ 0: closer to 0 = more consistent across contexts.
 # procrustes_dist is normalised residual of Procrustes(AB → BA): lower = better alignment.
@@ -85,6 +90,27 @@ df_labeled <- df %>%
 
 cat("Rows per checkpoint label:\n")
 print(count(df_labeled %>% filter(!is.na(ckpt_label)), model_size, ckpt_label, step))
+```
+
+```{r prep-decode}
+# Join decode accuracy into the last-layer data frames.
+# Key: model_size + step + phrase_AB + layer (layer numbers differ across model sizes).
+decode_join <- decode_raw %>%
+  select(model_size, step, phrase_AB, layer, n_AB, n_BA, decode_accuracy)
+
+df_decode <- df %>%
+  left_join(decode_join, by = c("model_size", "step", "phrase_AB", "layer")) %>%
+  filter(!is.na(decode_accuracy))
+
+df_decode_labeled <- df_labeled %>%
+  left_join(decode_join, by = c("model_size", "step", "phrase_AB", "layer")) %>%
+  filter(!is.na(decode_accuracy))
+
+df_decode_final <- df_decode_labeled %>% filter(ckpt_label == "final")
+
+cat(sprintf("Decode accuracy rows: %d\n", nrow(df_decode)))
+cat(sprintf("  Mean accuracy: %.3f\n", mean(df_decode$decode_accuracy)))
+cat(sprintf("  Range: %.3f – %.3f\n", min(df_decode$decode_accuracy), max(df_decode$decode_accuracy)))
 ```
 
 ## Visualisations
@@ -606,4 +632,308 @@ plots <- map(model_sizes, function(size) {
 
 wrap_plots(plots, nrow = 1) +
   plot_annotation(title = "Consistency × frequency interaction at final checkpoint")
+```
+
+## Linear Decodability
+
+How accurately can a logistic regression classifier (10-fold stratified CV;
+PCA → LogReg pipeline, PCA fitted inside each fold) decode the ordering (AB vs BA)
+from the last-layer representations? Higher accuracy = more separable ordering
+representations. Dashed line = chance (0.5).
+
+### Decode accuracy vs overall frequency at final checkpoint
+
+```{r viz-decode-freq, fig.height=4}
+ggplot(df_decode_final %>% filter(corpus_freq > 0),
+       aes(x = log_freq, y = decode_accuracy, colour = model_size)) +
+  geom_point(alpha = 0.25, size = 0.8) +
+  geom_smooth(method = "lm", se = TRUE) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", colour = "grey50") +
+  facet_wrap(~model_size, scales = "free_x") +
+  scale_colour_brewer(palette = "Set1", guide = "none") +
+  labs(
+    x     = "log(overall frequency)",
+    y     = "Decode accuracy",
+    title = "Linear decodability vs corpus frequency (final checkpoint, last layer)"
+  ) +
+  theme_minimal()
+```
+
+### Decode accuracy vs overall frequency across checkpoints
+
+```{r viz-decode-freq-checkpoints, fig.height=9}
+df_decode_labeled %>%
+  filter(!is.na(ckpt_label), corpus_freq > 0) %>%
+  mutate(ckpt_label = factor(ckpt_label, levels = c("early", "mid", "final"))) %>%
+  ggplot(aes(x = log_freq, y = decode_accuracy, colour = model_size)) +
+  geom_point(alpha = 0.25, size = 0.8) +
+  geom_smooth(method = "lm", se = TRUE) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", colour = "grey50") +
+  facet_grid(ckpt_label ~ model_size) +
+  scale_colour_brewer(palette = "Set1", guide = "none") +
+  labs(
+    x     = "log(overall frequency)",
+    y     = "Decode accuracy",
+    title = "Linear decodability vs corpus frequency across checkpoints (last layer)"
+  ) +
+  theme_minimal()
+```
+
+### Decode accuracy vs frequency (mean consistency partialled out)
+
+```{r viz-decode-partial, fig.height=4}
+df_decode_final %>%
+  filter(corpus_freq > 0) %>%
+  group_by(model_size) %>%
+  mutate(acc_resid = residuals(lm(decode_accuracy ~ mean_consistency))) %>%
+  ungroup() %>%
+  ggplot(aes(x = log_freq, y = acc_resid, colour = model_size)) +
+  geom_point(alpha = 0.25, size = 0.8) +
+  geom_smooth(method = "lm", se = TRUE) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  facet_wrap(~model_size, scales = "free_x") +
+  scale_colour_brewer(palette = "Set1", guide = "none") +
+  labs(
+    x     = "log(overall frequency)",
+    y     = "Decode accuracy (residual after mean consistency)",
+    title = "Linear decodability vs frequency, mean consistency partialled out (final checkpoint)"
+  ) +
+  theme_minimal()
+```
+
+### Frequency effect from joint OLS model (mean consistency held constant)
+
+```{r viz-decode-lm-adjusted, fig.height=4}
+models_dec_adj <- df_decode_final %>%
+  filter(corpus_freq > 0) %>%
+  group_by(model_size) %>%
+  nest() %>%
+  mutate(
+    data_c = map(data, ~ .x %>% mutate(
+      cons_c = mean_consistency - mean(mean_consistency),
+      freq_c = log_freq         - mean(log_freq)
+    )),
+    fit = map(data_c, ~ lm(decode_accuracy ~ cons_c + freq_c, data = .x))
+  )
+
+pred_lines_dec <- models_dec_adj %>%
+  mutate(preds = map2(fit, data_c, ~ {
+    grid <- tibble(freq_c = seq(min(.y$freq_c), max(.y$freq_c), length.out = 200),
+                   cons_c = 0) %>%
+      mutate(log_freq = freq_c + mean(.y$log_freq))
+    bind_cols(grid, as_tibble(predict(.x, newdata = grid, interval = "confidence")))
+  })) %>%
+  select(model_size, preds) %>%
+  unnest(preds)
+
+pts_dec_adj <- models_dec_adj %>%
+  mutate(pts = map2(fit, data_c, ~ {
+    b <- coef(.x)["cons_c"]
+    .y %>% mutate(acc_adj = decode_accuracy - b * cons_c)
+  })) %>%
+  select(model_size, pts) %>%
+  unnest(pts)
+
+ggplot() +
+  geom_point(data = pts_dec_adj,
+             aes(x = log_freq, y = acc_adj, colour = model_size),
+             alpha = 0.2, size = 0.8) +
+  geom_ribbon(data = pred_lines_dec,
+              aes(x = log_freq, ymin = lwr, ymax = upr, fill = model_size),
+              alpha = 0.25) +
+  geom_line(data = pred_lines_dec,
+            aes(x = log_freq, y = fit, colour = model_size),
+            linewidth = 0.9) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", colour = "grey50") +
+  facet_wrap(~model_size, scales = "free_x") +
+  scale_colour_brewer(palette = "Set1", guide = "none") +
+  scale_fill_brewer(palette = "Set1", guide = "none") +
+  labs(
+    x     = "log(overall frequency)",
+    y     = "Decode accuracy (partial)",
+    title = "Frequency effect on decodability at mean consistency — joint OLS (final checkpoint)"
+  ) +
+  theme_minimal()
+```
+
+### Decode accuracy over training
+
+```{r viz-decode-training, fig.height=5}
+df_decode %>%
+  group_by(model_size, log_tokens) %>%
+  summarise(mean_acc = mean(decode_accuracy),
+            se_acc   = sd(decode_accuracy) / sqrt(n()),
+            .groups  = "drop") %>%
+  ggplot(aes(x = log_tokens, y = mean_acc,
+             colour = model_size, fill = model_size)) +
+  geom_ribbon(aes(ymin = mean_acc - se_acc, ymax = mean_acc + se_acc),
+              alpha = 0.2, colour = NA) +
+  geom_line(linewidth = 0.8) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", colour = "grey50") +
+  scale_colour_brewer(palette = "Set1") +
+  scale_fill_brewer(palette = "Set1") +
+  labs(
+    x      = "log(tokens seen)",
+    y      = "Mean decode accuracy",
+    title  = "Linear decodability over training (last layer, mean ± SE across binomials)",
+    colour = "Model", fill = "Model"
+  ) +
+  theme_minimal()
+```
+
+## brms Models: Linear Decodability
+
+Outcome: `decode_accuracy` (10-fold CV accuracy, range ≈ [0.5, 1]; chance = 0.5).
+Predictors: `mean_consistency` and `log_freq`, both scaled within each model fit.
+Random effect: `(1 | phrase_AB)`. Family: Gaussian.
+
+```{r brms-decode-priors}
+priors_dec <- c(
+  prior(normal(0, 0.5),   class = b),
+  prior(normal(0.7, 0.2), class = Intercept),
+  prior(exponential(2),   class = sd),
+  prior(exponential(2),   class = sigma)
+)
+```
+
+### Checkpoint-specific decodability models (early / mid / final)
+
+```{r brms-decode-checkpoint-models, results="hide"}
+formula_dec <- decode_accuracy ~ cons_sc * freq_sc + (1 | phrase_AB)
+
+fit_dec_ckpt_models <- function(size) {
+  map(c("early", "mid", "final"), function(label) {
+    d <- df_decode_labeled %>%
+      filter(model_size == size, ckpt_label == label) %>%
+      mutate(cons_sc = as.vector(scale(mean_consistency)),
+             freq_sc = as.vector(scale(log_freq)))
+
+    brm(
+      formula_dec,
+      data   = d,
+      prior  = priors_dec,
+      family = gaussian(),
+      cores  = 4,
+      iter   = 2000,
+      seed   = 42,
+      file   = sprintf("../results/m_dec_%s_%s", size, label)
+    )
+  }) %>% set_names(c("early", "mid", "final"))
+}
+
+dec_ckpt_models <- map(model_sizes, fit_dec_ckpt_models) %>% set_names(model_sizes)
+```
+
+```{r decode-checkpoint-summaries}
+iwalk(dec_ckpt_models, function(size_models, size) {
+  iwalk(size_models, function(m, label) {
+    cat(sprintf("\n=== %s — %s checkpoint ===\n", size, label))
+    print(summary(m))
+  })
+})
+```
+
+```{r decode-checkpoint-coef-plot, fig.height=8}
+dec_coef_df <- imap_dfr(dec_ckpt_models, function(size_models, size) {
+  imap_dfr(size_models, function(m, label) {
+    as_draws_df(m) %>%
+      select(starts_with("b_"), -b_Intercept) %>%
+      pivot_longer(everything(), names_to = "term", values_to = "estimate") %>%
+      mutate(checkpoint = label, model_size = size)
+  })
+}) %>%
+  mutate(
+    checkpoint = factor(checkpoint, levels = c("early", "mid", "final")),
+    model_size = factor(model_size, levels = model_sizes)
+  )
+
+ggplot(dec_coef_df, aes(x = estimate, y = term, fill = checkpoint)) +
+  stat_halfeye(position = position_dodge(width = 0.6), alpha = 0.7) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  facet_wrap(~model_size, ncol = 1) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    x     = "Posterior estimate",
+    y     = NULL,
+    title = "Decodability model coefficients across early / mid / final checkpoints",
+    fill  = "Checkpoint"
+  ) +
+  theme_minimal()
+```
+
+### Full decodability model: effect of training progress (all checkpoints)
+
+```{r brms-decode-full-models, results="hide"}
+formula_dec_full <- decode_accuracy ~ cons_sc * freq_sc * log_tokens_sc + (1 | phrase_AB)
+
+fit_dec_full_model <- function(size) {
+  d <- df_decode %>%
+    filter(model_size == size) %>%
+    mutate(cons_sc       = as.vector(scale(mean_consistency)),
+           freq_sc       = as.vector(scale(log_freq)),
+           log_tokens_sc = as.vector(scale(log_tokens)))
+
+  brm(
+    formula_dec_full,
+    data   = d,
+    prior  = c(
+      prior(normal(0, 0.5),   class = b),
+      prior(normal(0.7, 0.2), class = Intercept),
+      prior(exponential(2),   class = sd),
+      prior(exponential(2),   class = sigma)
+    ),
+    family = gaussian(),
+    cores  = 4,
+    iter   = 2000,
+    seed   = 42,
+    file   = sprintf("../results/m_dec_%s_full", size)
+  )
+}
+
+dec_full_models <- map(model_sizes, fit_dec_full_model) %>% set_names(model_sizes)
+```
+
+```{r decode-full-summaries}
+iwalk(dec_full_models, function(m, size) {
+  cat(sprintf("\n=== %s — full model ===\n", size))
+  print(summary(m))
+})
+```
+
+```{r decode-full-coef-plot, fig.height=7}
+imap_dfr(dec_full_models, function(m, size) {
+  as_draws_df(m) %>%
+    select(starts_with("b_"), -b_Intercept) %>%
+    pivot_longer(everything(), names_to = "term", values_to = "estimate") %>%
+    mutate(model_size = size)
+}) %>%
+  mutate(model_size = factor(model_size, levels = model_sizes)) %>%
+  ggplot(aes(x = estimate, y = term)) +
+  stat_halfeye(fill = "#4393c3", alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  facet_wrap(~model_size, ncol = 1) +
+  labs(
+    x     = "Posterior estimate",
+    y     = NULL,
+    title = "Decodability full model coefficients (all checkpoints)"
+  ) +
+  theme_minimal()
+```
+
+### Conditional effects: consistency × frequency on decodability (final checkpoint)
+
+```{r decode-cond-effects, fig.height=4}
+dec_plots <- map(model_sizes, function(size) {
+  ce <- conditional_effects(
+    dec_ckpt_models[[size]][["final"]],
+    effects    = "cons_sc:freq_sc",
+    re_formula = NA
+  )
+  plot(ce, plot = FALSE)[[1]] +
+    labs(title = size, x = "Consistency (scaled)", y = "Decode accuracy") +
+    theme_minimal()
+})
+
+wrap_plots(dec_plots, nrow = 1) +
+  plot_annotation(title = "Consistency × frequency interaction on decodability (final checkpoint)")
 ```

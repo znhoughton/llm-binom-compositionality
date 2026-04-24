@@ -6,7 +6,7 @@ binomial_rep_analysis.py
 ------------------------
 Analyse representations of binomial expressions across:
   - Layers (all hidden layers, processed sequentially)
-  - Checkpoints (log-sampled, up to 20 per model)
+  - Checkpoints (log-sampled, up to 10 per model)
   - Model sizes (125m, 350m, 1.3b OPT BabyLM variants)
 
 Input CSV columns used:
@@ -80,7 +80,7 @@ REQUEST_BUFFER   = 20
 MAX_PER_REQUEST  = 80
 
 DEFAULT_BATCH_SIZE  = 512
-N_LOG_CHECKPOINTS   = 20
+N_LOG_CHECKPOINTS   = 10
 BINOMIAL_CHUNK_SIZE = 100   # ~20 GB peak CPU RAM per worker for 1.3b (2×100×500×25×2048×4 bytes)
 
 # Actual padded seq_len is driven by the batch's longest sentence (~40–60 tokens
@@ -416,7 +416,13 @@ def extract_representations(
     with tqdm(total=len(pairs), desc="  Sentences", leave=True) as pbar:
         while i < len(pairs):
             batch_pairs = pairs[i:i + current_bs]
-            sentences_in_batch = [s for _, s in batch_pairs]
+            # Prepend a space so sentence-initial words always receive the
+            # space-prefix BPE form (e.g. "Ġgums"), matching their mid-sentence
+            # tokenisation.  Without this, the first word of a phrase at
+            # position 0 may split into fewer/more subwords than the same word
+            # appearing mid-sentence, causing AB/BA phrase-token count
+            # mismatches for sentences where the phrase starts the sentence.
+            sentences_in_batch = [" " + s.lower() for _, s in batch_pairs]
             try:
                 enc = tokenizer(
                     sentences_in_batch,
@@ -437,9 +443,11 @@ def extract_representations(
                 B = len(batch_pairs)
                 span_mask = torch.zeros(B, seq_len, dtype=torch.bool)
                 valid_map: List[Tuple[int, str]] = []
-                for b_idx, (phrase, sentence) in enumerate(batch_pairs):
+                for b_idx, ((phrase, _), norm_sentence) in enumerate(
+                    zip(batch_pairs, sentences_in_batch)
+                ):
                     span = find_phrase_span_in_tokens(
-                        phrase, sentence, offset_mappings[b_idx]
+                        phrase, norm_sentence, offset_mappings[b_idx]
                     )
                     if span is not None:
                         span_mask[b_idx, span[0]:span[1] + 1] = True

@@ -567,6 +567,8 @@ def compute_scores_batched(
         #   change singular values.
         #   Also reuse L_A: ||A||_F² = tr(AAᵀ) = Σ eigenvalues.
         steps.set_description(f"    layer {layer_idx:>2d}  procrustes eigh")
+        A = A - A.mean(dim=1, keepdim=True)            # centre each cloud (remove mean position)
+        B = B - B.mean(dim=1, keepdim=True)
         AAT       = torch.bmm(A, A.transpose(1, 2))   # (N, n, n) = A Aᵀ
         L_A, U_A  = torch.linalg.eigh(AAT)            # L_A = S_A², U_A = left singular vecs
         norm_A_sq = L_A.clamp(min=0).sum(dim=1)       # ||A||_F² = Σ eigenvalues

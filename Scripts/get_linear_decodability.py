@@ -27,7 +27,7 @@ from pathlib import Path
 import numpy as np
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.model_selection import StratifiedKFold, cross_val_predict
 from sklearn.pipeline import Pipeline
 from tqdm import tqdm
 import torch
@@ -51,7 +51,7 @@ OUT_CSV = str(Path(PROJECT_ROOT) / "Data" / "linear_decodability.csv")
 
 FIELDNAMES = [
     "model", "model_size", "checkpoint", "step", "tokens",
-    "phrase_AB", "layer", "n_AB", "n_BA", "decode_accuracy",
+    "phrase_AB", "layer", "label", "logit",
 ]
 
 N_FOLDS     = 10    # stratified k-fold splits
@@ -86,19 +86,21 @@ def open_output(path: str):
 # ---------------------------------------------------------------------------
 # DECODABILITY
 # ---------------------------------------------------------------------------
-def decode_accuracy(A: np.ndarray, B: np.ndarray) -> float:
+def get_fold_predictions(A: np.ndarray, B: np.ndarray):
     """
-    10-fold stratified logistic regression accuracy for one (binomial, layer).
+    10-fold stratified CV for one (binomial, layer).
+    Returns (logits, labels) — one entry per held-out test example across all
+    folds — so the caller can write one row per sentence to the output CSV.
 
-    A: (n_AB, D) AB representations
-    B: (n_BA, D) BA representations
+    A: (n_AB, D) AB representations  (label 0)
+    B: (n_BA, D) BA representations  (label 1)
 
-    PCA is fitted inside each training fold (part of the pipeline), so there
-    is no data leakage between folds. Returns NaN if too few samples.
+    PCA is fitted inside each training fold to prevent leakage.
+    Returns (None, None) if too few samples.
     """
     n = min(len(A), len(B))
     if n < N_FOLDS * 2:
-        return float("nan")
+        return None, None
 
     X = np.concatenate([A[:n], B[:n]], axis=0)       # (2n, D)
     y = np.array([0] * n + [1] * n, dtype=np.int32)  # 0=AB, 1=BA
@@ -108,8 +110,8 @@ def decode_accuracy(A: np.ndarray, B: np.ndarray) -> float:
         ("clf", LogisticRegression(C=1.0, max_iter=1000, solver="lbfgs")),
     ])
     cv     = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
-    scores = cross_val_score(pipe, X, y, cv=cv, scoring="accuracy")
-    return float(scores.mean())
+    logits = cross_val_predict(pipe, X, y, cv=cv, method="decision_function")
+    return logits, y
 
 
 # ---------------------------------------------------------------------------
@@ -175,20 +177,22 @@ def process_checkpoint(
                     if reps_ab is None or reps_ba is None:
                         continue
 
-                    acc = decode_accuracy(reps_ab, reps_ba)
+                    logits, labels = get_fold_predictions(reps_ab, reps_ba)
+                    if logits is None:
+                        continue
                     completed.add((model_name, ckpt["checkpoint"], ab, layer_idx))
-                    writer.writerow({
-                        "model":           model_name,
-                        "model_size":      size_label,
-                        "checkpoint":      ckpt["checkpoint"],
-                        "step":            ckpt["step"],
-                        "tokens":          ckpt["tokens"],
-                        "phrase_AB":       ab,
-                        "layer":           layer_idx,
-                        "n_AB":            len(reps_ab),
-                        "n_BA":            len(reps_ba),
-                        "decode_accuracy": acc,
-                    })
+                    for logit, label in zip(logits, labels):
+                        writer.writerow({
+                            "model":      model_name,
+                            "model_size": size_label,
+                            "checkpoint": ckpt["checkpoint"],
+                            "step":       ckpt["step"],
+                            "tokens":     ckpt["tokens"],
+                            "phrase_AB":  ab,
+                            "layer":      layer_idx,
+                            "label":      int(label),
+                            "logit":      float(logit),
+                        })
 
                 out_file.flush()
 
@@ -255,9 +259,11 @@ def main():
     if Path(OUT_CSV).exists():
         import pandas as pd
         df = pd.read_csv(OUT_CSV)
-        print(f"  {len(df):,} rows  |  mean accuracy: {df['decode_accuracy'].mean():.3f}")
-        print(f"  Accuracy range: {df['decode_accuracy'].min():.3f} – "
-              f"{df['decode_accuracy'].max():.3f}")
+        n_binoms = df.groupby(["model", "checkpoint", "phrase_AB", "layer"]).ngroups
+        log_loss = np.log1p(np.exp(np.where(df["label"] == 1, -df["logit"], df["logit"])))
+        print(f"  {len(df):,} rows  |  {n_binoms:,} binomial×checkpoint×layer combinations")
+        print(f"  Mean log-loss: {log_loss.mean():.3f}  (chance = {np.log(2):.3f}"
+              f", range: {log_loss.min():.3f} – {log_loss.max():.3f})")
 
 
 if __name__ == "__main__":

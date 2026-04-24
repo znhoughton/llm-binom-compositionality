@@ -93,24 +93,43 @@ print(count(df_labeled %>% filter(!is.na(ckpt_label)), model_size, ckpt_label, s
 ```
 
 ```{r prep-decode}
-# Join decode accuracy into the last-layer data frames.
-# Key: model_size + step + phrase_AB + layer (layer numbers differ across model sizes).
+# Compute log-loss per sentence from raw logits.
+# log-loss = log(1 + exp(-logit)) for label=1, log(1 + exp(logit)) for label=0.
+# Chance = log(2) ≈ 0.693; lower = more separable.
+decode_raw <- decode_raw %>%
+  mutate(log_loss = log(1 + exp(if_else(label == 1, -logit, logit))))
+
+# Join to last-layer data frames (one-to-many: multiple sentences per binomial).
 decode_join <- decode_raw %>%
-  select(model_size, step, phrase_AB, layer, n_AB, n_BA, decode_accuracy)
+  select(model_size, step, phrase_AB, layer, label, logit, log_loss)
 
 df_decode <- df %>%
-  left_join(decode_join, by = c("model_size", "step", "phrase_AB", "layer")) %>%
-  filter(!is.na(decode_accuracy))
+  left_join(decode_join, by = c("model_size", "step", "phrase_AB", "layer"),
+            relationship = "one-to-many")
 
 df_decode_labeled <- df_labeled %>%
-  left_join(decode_join, by = c("model_size", "step", "phrase_AB", "layer")) %>%
-  filter(!is.na(decode_accuracy))
+  left_join(decode_join, by = c("model_size", "step", "phrase_AB", "layer"),
+            relationship = "one-to-many")
 
 df_decode_final <- df_decode_labeled %>% filter(ckpt_label == "final")
 
-cat(sprintf("Decode accuracy rows: %d\n", nrow(df_decode)))
-cat(sprintf("  Mean accuracy: %.3f\n", mean(df_decode$decode_accuracy)))
-cat(sprintf("  Range: %.3f – %.3f\n", min(df_decode$decode_accuracy), max(df_decode$decode_accuracy)))
+# Binomial-level aggregates for visualisations.
+df_decode_binom <- df_decode %>%
+  group_by(model_size, step, log_tokens, phrase_AB, layer,
+           log_freq, corpus_freq, mean_consistency) %>%
+  summarise(mean_log_loss = mean(log_loss), .groups = "drop")
+
+df_decode_binom_labeled <- df_decode_labeled %>%
+  group_by(model_size, step, log_tokens, phrase_AB, layer, ckpt_label,
+           log_freq, corpus_freq, mean_consistency) %>%
+  summarise(mean_log_loss = mean(log_loss), .groups = "drop")
+
+df_decode_binom_final <- df_decode_binom_labeled %>% filter(ckpt_label == "final")
+
+cat(sprintf("Individual prediction rows: %d\n", nrow(df_decode)))
+cat(sprintf("  Chance log-loss: %.3f\n", log(2)))
+cat(sprintf("  Mean log-loss:   %.3f\n", mean(df_decode$log_loss)))
+cat(sprintf("  Range:           %.3f – %.3f\n", min(df_decode$log_loss), max(df_decode$log_loss)))
 ```
 
 ## Visualisations
@@ -644,16 +663,16 @@ representations. Dashed line = chance (0.5).
 ### Decode accuracy vs overall frequency at final checkpoint
 
 ```{r viz-decode-freq, fig.height=4}
-ggplot(df_decode_final %>% filter(corpus_freq > 0),
-       aes(x = log_freq, y = decode_accuracy, colour = model_size)) +
+ggplot(df_decode_binom_final %>% filter(corpus_freq > 0),
+       aes(x = log_freq, y = mean_log_loss, colour = model_size)) +
   geom_point(alpha = 0.25, size = 0.8) +
   geom_smooth(method = "lm", se = TRUE) +
-  geom_hline(yintercept = 0.5, linetype = "dashed", colour = "grey50") +
+  geom_hline(yintercept = log(2), linetype = "dashed", colour = "grey50") +
   facet_wrap(~model_size, scales = "free_x") +
   scale_colour_brewer(palette = "Set1", guide = "none") +
   labs(
     x     = "log(overall frequency)",
-    y     = "Decode accuracy",
+    y     = "Mean log-loss (dashed = chance)",
     title = "Linear decodability vs corpus frequency (final checkpoint, last layer)"
   ) +
   theme_minimal()
@@ -662,18 +681,18 @@ ggplot(df_decode_final %>% filter(corpus_freq > 0),
 ### Decode accuracy vs overall frequency across checkpoints
 
 ```{r viz-decode-freq-checkpoints, fig.height=9}
-df_decode_labeled %>%
+df_decode_binom_labeled %>%
   filter(!is.na(ckpt_label), corpus_freq > 0) %>%
   mutate(ckpt_label = factor(ckpt_label, levels = c("early", "mid", "final"))) %>%
-  ggplot(aes(x = log_freq, y = decode_accuracy, colour = model_size)) +
+  ggplot(aes(x = log_freq, y = mean_log_loss, colour = model_size)) +
   geom_point(alpha = 0.25, size = 0.8) +
   geom_smooth(method = "lm", se = TRUE) +
-  geom_hline(yintercept = 0.5, linetype = "dashed", colour = "grey50") +
+  geom_hline(yintercept = log(2), linetype = "dashed", colour = "grey50") +
   facet_grid(ckpt_label ~ model_size) +
   scale_colour_brewer(palette = "Set1", guide = "none") +
   labs(
     x     = "log(overall frequency)",
-    y     = "Decode accuracy",
+    y     = "Mean log-loss (dashed = chance)",
     title = "Linear decodability vs corpus frequency across checkpoints (last layer)"
   ) +
   theme_minimal()
@@ -682,12 +701,12 @@ df_decode_labeled %>%
 ### Decode accuracy vs frequency (mean consistency partialled out)
 
 ```{r viz-decode-partial, fig.height=4}
-df_decode_final %>%
+df_decode_binom_final %>%
   filter(corpus_freq > 0) %>%
   group_by(model_size) %>%
-  mutate(acc_resid = residuals(lm(decode_accuracy ~ mean_consistency))) %>%
+  mutate(loss_resid = residuals(lm(mean_log_loss ~ mean_consistency))) %>%
   ungroup() %>%
-  ggplot(aes(x = log_freq, y = acc_resid, colour = model_size)) +
+  ggplot(aes(x = log_freq, y = loss_resid, colour = model_size)) +
   geom_point(alpha = 0.25, size = 0.8) +
   geom_smooth(method = "lm", se = TRUE) +
   geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
@@ -695,7 +714,7 @@ df_decode_final %>%
   scale_colour_brewer(palette = "Set1", guide = "none") +
   labs(
     x     = "log(overall frequency)",
-    y     = "Decode accuracy (residual after mean consistency)",
+    y     = "Mean log-loss (residual after mean consistency)",
     title = "Linear decodability vs frequency, mean consistency partialled out (final checkpoint)"
   ) +
   theme_minimal()
@@ -704,7 +723,7 @@ df_decode_final %>%
 ### Frequency effect from joint OLS model (mean consistency held constant)
 
 ```{r viz-decode-lm-adjusted, fig.height=4}
-models_dec_adj <- df_decode_final %>%
+models_dec_adj <- df_decode_binom_final %>%
   filter(corpus_freq > 0) %>%
   group_by(model_size) %>%
   nest() %>%
@@ -713,7 +732,7 @@ models_dec_adj <- df_decode_final %>%
       cons_c = mean_consistency - mean(mean_consistency),
       freq_c = log_freq         - mean(log_freq)
     )),
-    fit = map(data_c, ~ lm(decode_accuracy ~ cons_c + freq_c, data = .x))
+    fit = map(data_c, ~ lm(mean_log_loss ~ cons_c + freq_c, data = .x))
   )
 
 pred_lines_dec <- models_dec_adj %>%
@@ -729,14 +748,14 @@ pred_lines_dec <- models_dec_adj %>%
 pts_dec_adj <- models_dec_adj %>%
   mutate(pts = map2(fit, data_c, ~ {
     b <- coef(.x)["cons_c"]
-    .y %>% mutate(acc_adj = decode_accuracy - b * cons_c)
+    .y %>% mutate(loss_adj = mean_log_loss - b * cons_c)
   })) %>%
   select(model_size, pts) %>%
   unnest(pts)
 
 ggplot() +
   geom_point(data = pts_dec_adj,
-             aes(x = log_freq, y = acc_adj, colour = model_size),
+             aes(x = log_freq, y = loss_adj, colour = model_size),
              alpha = 0.2, size = 0.8) +
   geom_ribbon(data = pred_lines_dec,
               aes(x = log_freq, ymin = lwr, ymax = upr, fill = model_size),
@@ -744,13 +763,13 @@ ggplot() +
   geom_line(data = pred_lines_dec,
             aes(x = log_freq, y = fit, colour = model_size),
             linewidth = 0.9) +
-  geom_hline(yintercept = 0.5, linetype = "dashed", colour = "grey50") +
+  geom_hline(yintercept = log(2), linetype = "dashed", colour = "grey50") +
   facet_wrap(~model_size, scales = "free_x") +
   scale_colour_brewer(palette = "Set1", guide = "none") +
   scale_fill_brewer(palette = "Set1", guide = "none") +
   labs(
     x     = "log(overall frequency)",
-    y     = "Decode accuracy (partial)",
+    y     = "Mean log-loss (partial)",
     title = "Frequency effect on decodability at mean consistency — joint OLS (final checkpoint)"
   ) +
   theme_minimal()
@@ -759,22 +778,22 @@ ggplot() +
 ### Decode accuracy over training
 
 ```{r viz-decode-training, fig.height=5}
-df_decode %>%
+df_decode_binom %>%
   group_by(model_size, log_tokens) %>%
-  summarise(mean_acc = mean(decode_accuracy),
-            se_acc   = sd(decode_accuracy) / sqrt(n()),
-            .groups  = "drop") %>%
-  ggplot(aes(x = log_tokens, y = mean_acc,
+  summarise(mean_ll = mean(mean_log_loss),
+            se_ll   = sd(mean_log_loss) / sqrt(n()),
+            .groups = "drop") %>%
+  ggplot(aes(x = log_tokens, y = mean_ll,
              colour = model_size, fill = model_size)) +
-  geom_ribbon(aes(ymin = mean_acc - se_acc, ymax = mean_acc + se_acc),
+  geom_ribbon(aes(ymin = mean_ll - se_ll, ymax = mean_ll + se_ll),
               alpha = 0.2, colour = NA) +
   geom_line(linewidth = 0.8) +
-  geom_hline(yintercept = 0.5, linetype = "dashed", colour = "grey50") +
+  geom_hline(yintercept = log(2), linetype = "dashed", colour = "grey50") +
   scale_colour_brewer(palette = "Set1") +
   scale_fill_brewer(palette = "Set1") +
   labs(
     x      = "log(tokens seen)",
-    y      = "Mean decode accuracy",
+    y      = "Mean log-loss (dashed = chance)",
     title  = "Linear decodability over training (last layer, mean ± SE across binomials)",
     colour = "Model", fill = "Model"
   ) +
@@ -783,14 +802,16 @@ df_decode %>%
 
 ## brms Models: Linear Decodability
 
-Outcome: `decode_accuracy` (10-fold CV accuracy, range ≈ [0.5, 1]; chance = 0.5).
+Outcome: `log_loss` per sentence (chance = log(2) ≈ 0.693; lower = more separable).
+Each row is one held-out sentence prediction from 10-fold CV; `(1 | phrase_AB)`
+accounts for the multiple sentences per binomial.
 Predictors: `mean_consistency` and `log_freq`, both scaled within each model fit.
-Random effect: `(1 | phrase_AB)`. Family: Gaussian.
+Family: Gaussian.
 
 ```{r brms-decode-priors}
 priors_dec <- c(
   prior(normal(0, 0.5),   class = b),
-  prior(normal(0.7, 0.2), class = Intercept),
+  prior(normal(0.5, 0.2), class = Intercept),
   prior(exponential(2),   class = sd),
   prior(exponential(2),   class = sigma)
 )
@@ -799,7 +820,7 @@ priors_dec <- c(
 ### Checkpoint-specific decodability models (early / mid / final)
 
 ```{r brms-decode-checkpoint-models, results="hide"}
-formula_dec <- decode_accuracy ~ cons_sc * freq_sc + (1 | phrase_AB)
+formula_dec <- log_loss ~ cons_sc * freq_sc + (1 | phrase_AB)
 
 fit_dec_ckpt_models <- function(size) {
   map(c("early", "mid", "final"), function(label) {
@@ -864,7 +885,7 @@ ggplot(dec_coef_df, aes(x = estimate, y = term, fill = checkpoint)) +
 ### Full decodability model: effect of training progress (all checkpoints)
 
 ```{r brms-decode-full-models, results="hide"}
-formula_dec_full <- decode_accuracy ~ cons_sc * freq_sc * log_tokens_sc + (1 | phrase_AB)
+formula_dec_full <- log_loss ~ cons_sc * freq_sc * log_tokens_sc + (1 | phrase_AB)
 
 fit_dec_full_model <- function(size) {
   d <- df_decode %>%
@@ -878,7 +899,7 @@ fit_dec_full_model <- function(size) {
     data   = d,
     prior  = c(
       prior(normal(0, 0.5),   class = b),
-      prior(normal(0.7, 0.2), class = Intercept),
+      prior(normal(0.5, 0.2), class = Intercept),
       prior(exponential(2),   class = sd),
       prior(exponential(2),   class = sigma)
     ),

@@ -171,6 +171,8 @@ def log_sample_checkpoints(checkpoints: List[Dict], n: int = 20) -> List[Dict]:
     total = len(checkpoints)
     if total <= n:
         return checkpoints
+    if n == 1:
+        return [checkpoints[-1]]
     indices = sorted(set(
         min(int(round(math.exp(x))) - 1, total - 1)
         for x in np.linspace(math.log(1), math.log(total), n)

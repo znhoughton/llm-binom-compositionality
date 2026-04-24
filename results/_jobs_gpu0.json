@@ -1,1 +1,0 @@
-[{"model_name": "znhoughton/opt-babylm-1.3b-20eps-seed964", "ckpt": {"checkpoint": "step-9312", "tag": "step-9312", "step": 9312, "tokens": 9535488000}, "weight": 26.0}, {"model_name": "znhoughton/opt-babylm-1.3b-20eps-seed964", "ckpt": {"checkpoint": "step-15908", "tag": "step-15908", "step": 15908, "tokens": 16289792000}, "weight": 26.0}]

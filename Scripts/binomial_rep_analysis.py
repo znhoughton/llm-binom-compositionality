@@ -20,8 +20,12 @@ Input CSV columns used:
 For each attested binomial, for each layer × checkpoint × model, computes:
   - self_sim_AB:      mean off-diagonal of centred kernel K=AA^T (Alpha ordering)
   - self_sim_BA:      same for Nonalpha ordering
-  - self_sim_ratio:   self_sim_AB / self_sim_BA
-  - procrustes_dist:  normalised residual of orthogonal Procrustes(A → B)
+  - self_sim_ratio:   self_sim_BA / self_sim_AB  (> 1 when AB more consistent)
+  - norm_AB:          Frobenius norm of centred AB cloud  ||A_c||_F
+  - norm_BA:          Frobenius norm of centred BA cloud  ||B_c||_F
+  - sum_sigma:        sum of singular values of A_c^T B_c  (cross-cloud alignment)
+  - procrustes_dist:  normalised residual  ||A_c R* - B_c||_F / ||B_c||_F
+  - rotation_cost:    ||R* - I||_F  (how far the optimal rotation deviates from identity)
 
 Output: Scripts/../results/binomial_representations.csv
 Plots:  Scripts/../Plots/
@@ -58,8 +62,9 @@ PROJECT_ROOT = SCRIPT_DIR.parent                        # project root
 BINOMS_CSV        = str(PROJECT_ROOT / "Data" / "nonce_and_attested_binoms.csv")
 OUT_DIR           = str(PROJECT_ROOT / "results")
 OUT_CSV           = str(PROJECT_ROOT / "results" / "binomial_representations.csv")
-SENTENCE_POOL_CSV = str(PROJECT_ROOT / "results" / "sentence_pool.csv")
-PLOTS_DIR         = str(PROJECT_ROOT / "Plots")
+SENTENCE_POOL_CSV  = str(PROJECT_ROOT / "results" / "sentence_pool.csv")
+CORPUS_FREQS_CSV   = str(PROJECT_ROOT / "Data"    / "babylm_corpus_freqs.csv")
+PLOTS_DIR          = str(PROJECT_ROOT / "Plots")
 
 # ---------------------------------------------------------------------------
 # CONFIG
@@ -430,6 +435,7 @@ def compute_scores_batched(
     chunk_reps: Dict[str, Dict[int, np.ndarray]],
     pairs: List[Tuple[str, str]],
     device: str,
+    layers_filter: Optional[str] = None,
 ) -> Dict[str, List[Dict]]:
     """
     Compute self-similarity and Procrustes scores for all binomial pairs,
@@ -516,6 +522,12 @@ def compute_scores_batched(
 
     scores_by_ab: Dict[str, List[Dict]] = {ab: [] for ab, _ in valid_pairs}
 
+    if layers_filter == "last":
+        all_layers = [max(all_layers)] if all_layers else []
+    elif layers_filter is not None:
+        keep = set(int(x) for x in layers_filter.split(","))
+        all_layers = [l for l in all_layers if l in keep]
+
     for layer_idx in tqdm(all_layers, desc="  Layers", position=0):
         layer_pairs = [
             (ab, ba) for ab, ba in valid_pairs
@@ -526,7 +538,7 @@ def compute_scores_batched(
 
         steps = tqdm(
             ["stack", "self-sim AB", "self-sim BA", "procrustes eigh",
-             "procrustes svd", "collect"],
+             "procrustes svd", "rotation cost", "collect"],
             desc=f"    layer {layer_idx:>2d}",
             leave=False,
             position=1,
@@ -579,31 +591,62 @@ def compute_scores_batched(
         steps.set_description(f"    layer {layer_idx:>2d}  procrustes svd")
         S_A      = L_A.clamp(min=0).sqrt()                              # (N, n) singular values of A
         C        = S_A.unsqueeze(-1) * torch.bmm(U_A.transpose(1, 2), B)  # (N, n, D): diag(S_A) U_Aᵀ B
-        S        = torch.linalg.svd(C, full_matrices=False, driver='gesvd').S  # (N, n): σᵢ(AᵀB) via σᵢ(C)
-        resid_sq = (norm_A_sq + norm_B_sq - 2.0 * S.sum(dim=1)).clamp(min=0.0)
-        proc     = resid_sq.sqrt() / norm_B_sq.sqrt().clamp(min=1e-10)  # normalised residual
+        svd_out        = torch.linalg.svd(C, full_matrices=False, driver='gesvd')
+        U_C, S_C, Vh_C = svd_out.U, svd_out.S, svd_out.Vh    # (N,n,n), (N,n), (N,n,D)
+        sum_sigma      = S_C.sum(dim=1)                        # (N,): Σ σᵢ(AᵀB)
+        resid_sq       = (norm_A_sq + norm_B_sq - 2.0 * sum_sigma).clamp(min=0.0)
+        proc           = resid_sq.sqrt() / norm_B_sq.sqrt().clamp(min=1e-10)
+        if device != "cpu": torch.cuda.synchronize()
+        steps.update(1)
+
+        steps.set_description(f"    layer {layer_idx:>2d}  rotation cost")
+        # Optimal rotation: R* = Vh_C^T U_C^T V_A^T
+        # where V_A^T = diag(1/S_A) U_A^T A_c  (right singular vectors of A_c)
+        #
+        # tr(R*) via cyclic property + trace identity tr(XY) = (X * Y^T).sum():
+        #   tr(R*) = tr(V_A^T Vh_C^T U_C^T) = (M * U_C).sum()
+        #   where M = diag(1/S_A) (U_A^T (A_c Vh_C^T))
+        #
+        # All intermediates are (N, n, n) — the (N, n, D) V_A^T tensor is never formed.
+        #
+        # ||R* - I||_F^2 = 2n - 2·tr(R*)
+        # The D-n inactive dimensions contribute D-n to tr(R*) on both sides and cancel,
+        # so this formula gives the correct full-space Frobenius distance.
+        P        = torch.bmm(A,  Vh_C.transpose(1, 2))               # (N, n, n)
+        Q        = torch.bmm(U_A.transpose(1, 2), P)                  # (N, n, n)
+        M        = Q * (1.0 / S_A.clamp(min=1e-10)).unsqueeze(-1)     # (N, n, n)
+        R_trace  = (M * U_C).sum(dim=(1, 2))                          # (N,): tr(R*)
+        rot_cost = (2.0 * n - 2.0 * R_trace).clamp(min=0.0).sqrt()   # (N,): ||R* - I||_F
         if device != "cpu": torch.cuda.synchronize()
         steps.update(1)
 
         steps.set_description(f"    layer {layer_idx:>2d}  collect")
-        ss_ab_np = ss_ab.cpu().numpy()
-        ss_ba_np = ss_ba.cpu().numpy()
-        proc_np  = proc.cpu().numpy()
+        ss_ab_np     = ss_ab.cpu().numpy()
+        ss_ba_np     = ss_ba.cpu().numpy()
+        proc_np      = proc.cpu().numpy()
+        rot_cost_np  = rot_cost.cpu().numpy()
+        sum_sigma_np = sum_sigma.cpu().numpy()
+        norm_A_np    = norm_A_sq.sqrt().cpu().numpy()
+        norm_B_np    = norm_B_sq.sqrt().cpu().numpy()
         steps.update(1)
         steps.close()
 
         for i, (ab, ba) in enumerate(layer_pairs):
             s_ab  = float(ss_ab_np[i])
             s_ba  = float(ss_ba_np[i])
-            ratio = s_ab / s_ba if (math.isfinite(s_ba) and s_ba != 0.0) else float("nan")
+            ratio = s_ba / s_ab if (math.isfinite(s_ab) and s_ab != 0.0) else float("nan")
             scores_by_ab[ab].append({
                 "layer":           layer_idx,
                 "n_sentences_AB":  len(A_arrs[i]),
                 "n_sentences_BA":  len(B_arrs[i]),
+                "norm_AB":         float(norm_A_np[i]),
+                "norm_BA":         float(norm_B_np[i]),
+                "sum_sigma":       float(sum_sigma_np[i]),
                 "self_sim_AB":     s_ab,
                 "self_sim_BA":     s_ba,
                 "self_sim_ratio":  ratio,
                 "procrustes_dist": float(proc_np[i]),
+                "rotation_cost":   float(rot_cost_np[i]),
             })
 
     return scores_by_ab
@@ -618,8 +661,9 @@ FIELDNAMES = [
     "overall_freq", "rel_freq",
     "layer",
     "n_sentences_AB", "n_sentences_BA",
+    "norm_AB", "norm_BA", "sum_sigma",
     "self_sim_AB", "self_sim_BA", "self_sim_ratio",
-    "procrustes_dist",
+    "procrustes_dist", "rotation_cost",
 ]
 
 
@@ -694,6 +738,42 @@ def merge_temp_csv(tmp_csv: str, out_csv: str):
     print(f"  Done — temp file removed.")
 
 # ---------------------------------------------------------------------------
+# BACKUP AND POST-PROCESSING
+# ---------------------------------------------------------------------------
+
+def backup_results(out_csv: str) -> None:
+    """Rename existing results CSV to a timestamped backup file."""
+    p = Path(out_csv)
+    if not p.exists():
+        return
+    from datetime import datetime
+    ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup = p.with_name(f"{p.stem}_backup_{ts}{p.suffix}")
+    p.rename(backup)
+    print(f"  Backed up existing results → {backup.name}")
+
+
+def postprocess_frequencies(out_csv: str, corpus_freqs_csv: str) -> None:
+    """Replace web-corpus frequency estimates with BabyLM corpus counts."""
+    if not Path(out_csv).exists():
+        return
+    if not Path(corpus_freqs_csv).exists():
+        print(f"  ⚠️  Corpus freqs CSV not found: {corpus_freqs_csv} — skipping.")
+        return
+    print(f"\nPost-processing: replacing frequency statistics ...")
+    df    = pd.read_csv(out_csv)
+    freqs = pd.read_csv(corpus_freqs_csv)[["phrase_AB", "overall_freq", "rel_freq"]]
+    df    = df.drop(columns=["overall_freq", "rel_freq"], errors="ignore")
+    df    = df.merge(freqs, on="phrase_AB", how="left")
+    # Restore column order from FIELDNAMES
+    cols  = [c for c in FIELDNAMES if c in df.columns]
+    df    = df[cols]
+    df.to_csv(out_csv, index=False)
+    n_merged = df["overall_freq"].notna().sum()
+    print(f"  Merged corpus frequencies for {n_merged:,} / {len(df):,} rows → {out_csv}")
+
+
+# ---------------------------------------------------------------------------
 # PER-CHECKPOINT HELPER
 # ---------------------------------------------------------------------------
 
@@ -708,6 +788,7 @@ def _process_checkpoint(
     device: str,
     writer,
     out_file,
+    layers_filter: Optional[str] = None,
 ):
     """Load one checkpoint, extract representations, compute scores, write results."""
     size_label = config["size_label"]
@@ -761,7 +842,8 @@ def _process_checkpoint(
 
             print(f"  Computing scores ...")
             chunk_pairs = [(r["phrase_AB"], r["phrase_BA"]) for _, r in chunk_df.iterrows()]
-            all_scores = compute_scores_batched(chunk_reps, chunk_pairs, device)
+            all_scores = compute_scores_batched(chunk_reps, chunk_pairs, device,
+                                                layers_filter=layers_filter)
 
             for _, row in chunk_df.iterrows():
                 ab, ba = row["phrase_AB"], row["phrase_BA"]
@@ -816,6 +898,15 @@ def main():
                         help="Worker GPU index (set by coordinator, not by user).")
     parser.add_argument("--jobs-file", default=None,
                         help="JSON file listing this worker's assigned checkpoints.")
+    parser.add_argument("--n-checkpoints", type=int, default=N_LOG_CHECKPOINTS,
+                        help="Number of log-sampled checkpoints per model "
+                             "(1 = final checkpoint only, default=%(default)s).")
+    parser.add_argument("--layers", type=str, default="all",
+                        help="Layers to score: 'all' (default), 'last', or "
+                             "comma-separated indices e.g. '0,12,24'.")
+    parser.add_argument("--backup", action="store_true",
+                        help="Rename the existing results CSV to a timestamped "
+                             "backup before writing new results.")
     args = parser.parse_args()
 
     # ── Multi-GPU coordinator ─────────────────────────────────────────────────
@@ -825,10 +916,14 @@ def main():
     if args.gpu is None and torch.cuda.device_count() >= 2:
         print(f"Detected {torch.cuda.device_count()} GPUs — running with dynamic load balancing.")
 
+        os.makedirs(OUT_DIR, exist_ok=True)
+
+        if args.backup:
+            backup_results(OUT_CSV)
+
         # Merge any leftover temp CSVs from a previous interrupted run so that
         # load_completed sees all previously written results and doesn't re-run
         # checkpoints that are already done.
-        os.makedirs(OUT_DIR, exist_ok=True)
         for gpu_id in range(torch.cuda.device_count()):
             tmp = str(Path(OUT_CSV).with_name(
                 Path(OUT_CSV).stem + f"_gpu{gpu_id}_tmp.csv"
@@ -858,7 +953,7 @@ def main():
             ckpts = get_model_checkpoints(model_name, config["tokens_per_step"])
             if not ckpts:
                 continue
-            ckpts = log_sample_checkpoints(ckpts, n=N_LOG_CHECKPOINTS)
+            ckpts = log_sample_checkpoints(ckpts, n=args.n_checkpoints)
             for ckpt in ckpts:
                 if ckpt_done_counts.get((model_name, ckpt["checkpoint"]), 0) >= n_binomials:
                     continue  # all binomials done for this checkpoint
@@ -895,7 +990,8 @@ def main():
 
             p = subprocess.Popen(
                 [sys.executable, __file__,
-                 "--gpu", str(gpu_id), "--jobs-file", jf],
+                 "--gpu", str(gpu_id), "--jobs-file", jf,
+                 "--layers", args.layers],
             )
             procs.append(p)
 
@@ -916,14 +1012,21 @@ def main():
             ))
             merge_temp_csv(tmp, OUT_CSV)
 
+        postprocess_frequencies(OUT_CSV, CORPUS_FREQS_CSV)
         print("\n🏁 Both GPU workers finished.")
         return
 
     # ── Worker / single-GPU path ──────────────────────────────────────────────
+    layers_filter = None if args.layers == "all" else args.layers
+
     active_csv = (
         str(Path(OUT_CSV).with_name(Path(OUT_CSV).stem + f"_gpu{args.gpu}_tmp.csv"))
         if args.gpu is not None else OUT_CSV
     )
+
+    # Backup only in the standalone single-GPU path (coordinator handles its own backup).
+    if args.gpu is None and args.backup:
+        backup_results(active_csv)
 
     print(f"Loading binomials ...")
     binoms_df = load_binomials(BINOMS_CSV)
@@ -983,6 +1086,7 @@ def main():
                         model_name, config, job["ckpt"], tokenizer,
                         binoms_df, phrase_sentence_map, completed,
                         device, writer, out_file,
+                        layers_filter=layers_filter,
                     )
         else:
             # ── Single-GPU: process all models sequentially ───────────────────
@@ -994,13 +1098,14 @@ def main():
                 if not checkpoints:
                     print("  No checkpoints found, skipping.")
                     continue
-                checkpoints = log_sample_checkpoints(checkpoints, n=N_LOG_CHECKPOINTS)
+                checkpoints = log_sample_checkpoints(checkpoints, n=args.n_checkpoints)
                 tokenizer = _load_tokenizer(config)
                 for ckpt in checkpoints:
                     _process_checkpoint(
                         model_name, config, ckpt, tokenizer,
                         binoms_df, phrase_sentence_map, completed,
                         device, writer, out_file,
+                        layers_filter=layers_filter,
                     )
     finally:
         out_file.close()
@@ -1009,6 +1114,9 @@ def main():
     # after all workers exit. Only merge here for standalone --gpu runs.
     if active_csv != OUT_CSV and args.jobs_file is None:
         merge_temp_csv(active_csv, OUT_CSV)
+
+    if args.gpu is None:
+        postprocess_frequencies(OUT_CSV, CORPUS_FREQS_CSV)
 
     print(f"\n🏁 Pipeline complete.  Results → {OUT_CSV}")
 

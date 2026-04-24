@@ -59,7 +59,9 @@ df <- df_raw %>%
     # Zero-corpus binomials get rel_freq = 0.5 (no ordering evidence either way)
     corpus_rel_freq = if_else(is.na(corpus_rel_freq), 0.5, corpus_rel_freq),
     # Negate self_sim so higher = more consistent (easier to interpret)
-    consistency = -self_sim_AB,
+    consistency      = -self_sim_AB,
+    consistency_BA   = -self_sim_BA,
+    mean_consistency = (consistency + consistency_BA) / 2,
     model_size  = factor(model_size, levels = c("125m", "350m", "1.3b"))
   )
 
@@ -169,6 +171,69 @@ ggplot(df_final, aes(x = log_freq, y = consistency, colour = model_size)) +
     title = "Predictor correlation: consistency vs frequency"
   ) +
   theme_minimal()
+```
+
+### Partial residual: frequency effect after controlling for consistency
+
+Procrustes distance residualised on consistency (within each model). If frequency
+still predicts the residual, there is a frequency effect beyond the stability confound.
+
+```{r viz-partial-resid, fig.height=4}
+df_final %>%
+  filter(corpus_freq > 0) %>%
+  group_by(model_size) %>%
+  mutate(proc_resid = residuals(lm(procrustes_dist ~ mean_consistency))) %>%
+  ungroup() %>%
+  ggplot(aes(x = log_freq, y = proc_resid, colour = model_size)) +
+  geom_point(alpha = 0.25, size = 0.8) +
+  geom_smooth(method = "lm", se = TRUE) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  facet_wrap(~model_size, scales = "free_y") +
+  scale_colour_brewer(palette = "Set1", guide = "none") +
+  labs(
+    x     = "log(overall frequency)",
+    y     = "Procrustes residual (consistency removed)",
+    title = "Frequency effect on Procrustes distance after partialling out consistency (final checkpoint)"
+  ) +
+  theme_minimal()
+```
+
+### Frequency vs Procrustes distance within consistency quartiles
+
+Within each consistency quartile, does frequency still predict Procrustes distance?
+If the slope flattens inside quartiles relative to the overall slope, frequency is
+acting largely through representation stability.
+
+```{r viz-freq-by-cons-quartile, fig.height=5}
+df_final %>%
+  filter(corpus_freq > 0) %>%
+  group_by(model_size) %>%
+  mutate(
+    cons_quartile = ntile(mean_consistency, 4),
+    cons_label    = factor(
+      case_when(
+        cons_quartile == 1 ~ "Q1 (low)",
+        cons_quartile == 2 ~ "Q2",
+        cons_quartile == 3 ~ "Q3",
+        cons_quartile == 4 ~ "Q4 (high)"
+      ),
+      levels = c("Q1 (low)", "Q2", "Q3", "Q4 (high)")
+    )
+  ) %>%
+  ungroup() %>%
+  ggplot(aes(x = log_freq, y = procrustes_dist, colour = cons_label)) +
+  geom_point(alpha = 0.2, size = 0.8) +
+  geom_smooth(method = "lm", se = TRUE) +
+  facet_wrap(~model_size, scales = "free") +
+  scale_colour_viridis_d(option = "mako", end = 0.85) +
+  labs(
+    x      = "log(overall frequency)",
+    y      = "Procrustes distance",
+    colour = "Consistency quartile",
+    title  = "Frequency vs Procrustes distance within consistency quartiles (final checkpoint, last layer)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
 ```
 
 ### Effect of frequency on Procrustes distance across layers
@@ -359,7 +424,7 @@ df %>%
 All models are fit separately per LLM (125m, 350m, 1.3b).
 
 Outcome: `procrustes_dist`.
-Predictors: `consistency` (−self_sim_AB) and `log_freq`, both scaled within each model fit.
+Predictors: `mean_consistency` (mean of −self_sim_AB and −self_sim_BA) and `log_freq`, both scaled within each model fit.
 Random effect: `(1 | phrase_AB)`.
 Family: Gaussian (beta regression would be more principled for a 0–1 outcome but is a reasonable starting point).
 
@@ -386,7 +451,7 @@ fit_ckpt_models <- function(size) {
   map(c("early", "mid", "final"), function(label) {
     d <- df_labeled %>%
       filter(model_size == size, ckpt_label == label) %>%
-      mutate(cons_sc = as.vector(scale(consistency)),
+      mutate(cons_sc = as.vector(scale(mean_consistency)),
              freq_sc = as.vector(scale(log_freq)))
 
     brm(
@@ -450,7 +515,7 @@ formula_full <- procrustes_dist ~ cons_sc * freq_sc * log_tokens_sc + (1 | phras
 fit_full_model <- function(size) {
   d <- df %>%
     filter(model_size == size) %>%
-    mutate(cons_sc       = as.vector(scale(consistency)),
+    mutate(cons_sc       = as.vector(scale(mean_consistency)),
            freq_sc       = as.vector(scale(log_freq)),
            log_tokens_sc = as.vector(scale(log_tokens)))
 

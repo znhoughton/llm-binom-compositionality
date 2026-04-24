@@ -304,6 +304,87 @@ model sizes where hidden norms may differ.
 
 ---
 
+## 4b. Rotation Cost
+
+**File:** `compute_scores_batched`, rotation cost section
+
+### 4b.1 Motivation
+
+`procrustes_dist` measures the **residual after rotation** — how well the two clouds
+align once optimally rotated.  But it does not tell you how large that rotation was.
+Two very different situations can yield the same low residual:
+
+- The clouds were nearly identical to begin with (tiny rotation needed).
+- The clouds have the same geometric shape but are systematically oriented
+  differently in representation space (large rotation needed).
+
+`rotation_cost` = $\|R^* - I\|_F$ quantifies the second dimension: how far the
+optimal rotation deviates from the identity (no rotation).
+
+### 4b.2 Deriving tr(R*) without forming R*
+
+From the thin-factorisation shortcut we have:
+
+$$A_c^\top B_c = V_A C, \quad C = U_C S_C V_{h,C}^\top$$
+
+so the SVD of $A_c^\top B_c$ is $(V_A U_C)\, S_C\, V_{h,C}^\top$, giving
+$R^* = V_{h,C}^\top U_C^\top V_A^\top$.
+
+We want $\text{tr}(R^*)$.  Using the **cyclic property**:
+
+$$\text{tr}(R^*) = \text{tr}(V_A^\top V_{h,C}^\top U_C^\top)$$
+
+Now $V_A^\top = \text{diag}(1/S_A)\, U_A^\top A_c$ (right singular vectors of $A_c$),
+so:
+
+$$V_A^\top V_{h,C}^\top = \underbrace{\text{diag}(1/S_A)\, U_A^\top (A_c V_{h,C}^\top)}_{M}$$
+
+where $M$ is $(n \times n)$ — **no $(n \times D)$ tensor is ever formed**.
+
+Finally, using the **trace identity** $\text{tr}(XY) = (X \odot Y^\top)\text{.sum()}$:
+
+$$\text{tr}(R^*) = \text{tr}(M U_C^\top) = (M \odot U_C)\text{.sum()}$$
+
+### 4b.3 Frobenius distance from identity
+
+For an $n \times n$ rotation matrix $R$:
+
+$$\|R - I\|_F^2 = \text{tr}((R-I)^\top(R-I)) = 2n - 2\,\text{tr}(R)$$
+
+The $D - n$ inactive dimensions (outside the column space of $A_c$) contribute
+$D - n$ to $\text{tr}(R^*)$ on both sides and cancel, so the formula is valid
+for the full $D$-dimensional space.
+
+$$\boxed{\text{rotation\_cost} = \|R^* - I\|_F = \sqrt{2n - 2\,\text{tr}(R^*)}}$$
+
+Range: $[0,\; 2\sqrt{n}]$.  For $n = 500$: $[0,\; \approx 44.7]$.
+
+### 4b.4 Code
+
+```python
+# P = A_c Vh_C^T : (N, n, n)
+P       = torch.bmm(A,  Vh_C.transpose(1, 2))
+# Q = U_A^T P   : (N, n, n)
+Q       = torch.bmm(U_A.transpose(1, 2), P)
+# M = diag(1/S_A) Q  : (N, n, n)
+M       = Q * (1.0 / S_A.clamp(min=1e-10)).unsqueeze(-1)
+# tr(R*) = (M ⊙ U_C).sum()
+R_trace = (M * U_C).sum(dim=(1, 2))
+# ||R* - I||_F
+rot_cost = (2.0 * n - 2.0 * R_trace).clamp(min=0.0).sqrt()
+```
+
+### 4b.5 Interpretation with `procrustes_dist`
+
+| `procrustes_dist` | `rotation_cost` | Interpretation |
+|---|---|---|
+| Low | Low | Clouds nearly identical (same shape, same orientation) |
+| Low | High | Same shape, systematically rotated — ordering changes *direction* not *structure* |
+| High | Low | Different shapes, similar orientation — ordering changes local geometry |
+| High | High | Clouds differ in both shape and orientation |
+
+---
+
 ## 5. Batching Strategy
 
 **File:** `compute_scores_batched` (line ~501)
@@ -357,11 +438,20 @@ model's layer count ahead of time.
 |---|---|---|---|
 | `self_sim_AB` | $-\|X_c^{AB}\|_F^2 / (n(n-1))$ | Consistent AB reps | Context-dependent AB reps |
 | `self_sim_BA` | $-\|X_c^{BA}\|_F^2 / (n(n-1))$ | Consistent BA reps | Context-dependent BA reps |
-| `self_sim_ratio` | `self_sim_AB / self_sim_BA` | AB more consistent than BA | BA more consistent than AB |
+| `self_sim_ratio` | `self_sim_BA / self_sim_AB` | AB more consistent than BA | BA more consistent than AB |
+| `norm_AB` | $\|A_c\|_F$ | Large / spread AB cloud | Tight / collapsed AB cloud |
+| `norm_BA` | $\|B_c\|_F$ | Large / spread BA cloud | Tight / collapsed BA cloud |
+| `sum_sigma` | $\sum_i \sigma_i(A_c^\top B_c)$ | Strong cross-cloud alignment | Weak cross-cloud alignment |
 | `procrustes_dist` | $\|A_c R^*-B_c\|_F / \|B_c\|_F$ | Poor geometric alignment | Good geometric alignment |
+| `rotation_cost` | $\|R^* - I\|_F$ | Large rotation needed | Little rotation needed |
 
 Note: self-similarity scores are ≤ 0 (they are negative squared norms divided
 by a positive constant).  "Higher" means closer to 0, i.e. less spread.
+
+The ratio is `self_sim_BA / self_sim_AB` (not AB/BA) because both values are
+negative: dividing the more-negative (more-spread) BA value by the
+less-negative (less-spread) AB value gives a ratio > 1 when AB is more
+consistent, which is the intuitive direction.
 
 $A_c$ and $B_c$ denote the mean-centred AB and BA representation matrices
 (each row shifted by its cloud's mean vector before the Procrustes step).

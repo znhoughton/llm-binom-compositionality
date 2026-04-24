@@ -313,9 +313,11 @@ def collect_sentences(
              for _, row in binoms_df.iterrows()]
 
     # Only AB needs to reach the target count; BA is derived.
+    # Allow up to 2 missing sentences per binomial (may have been removed during
+    # pool cleaning) rather than triggering a regeneration call.
     remaining = [
         (ab, ba) for ab, ba in pairs
-        if len(pool.get(ab, [])) < max_per_ordering
+        if len(pool.get(ab, [])) < max_per_ordering - 2
     ]
 
     print(f"\nGenerating sentences for {len(binoms_df)} binomials via Claude API ...")

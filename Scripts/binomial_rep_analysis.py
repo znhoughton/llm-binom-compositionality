@@ -113,6 +113,7 @@ EXTRA_MODEL_CONFIGS = {
         "chunk_size":        100,
         "trust_remote_code": True,
         "torch_dtype":       "float16",
+        "job_weight":        7.0,
     },
     "allenai/OLMo-2-1124-7B": {
         "size_label":        "olmo-7b",
@@ -121,6 +122,7 @@ EXTRA_MODEL_CONFIGS = {
         "chunk_size":        50,
         "trust_remote_code": True,
         "torch_dtype":       "float16",
+        "job_weight":        50.0,
     },
 }
 
@@ -749,19 +751,30 @@ def _process_checkpoint(
         print(f"  ✅ Already complete — skipping download.")
         return
 
-    tmp_cache = tempfile.mkdtemp(prefix="hf_ckpt_")
+    use_tmp_cache = bool(ckpt["tag"])
+    tmp_cache = tempfile.mkdtemp(prefix="hf_ckpt_") if use_tmp_cache else None
     model = None
     try:
-        load_kw = dict(low_cpu_mem_usage=True, cache_dir=tmp_cache)
+        load_kw = dict(low_cpu_mem_usage=True)
         if ckpt["tag"]:
             load_kw["revision"] = ckpt["tag"]
+            load_kw["cache_dir"] = tmp_cache
+        if config.get("trust_remote_code"):
+            load_kw["trust_remote_code"] = True
+        if config.get("torch_dtype") == "float16":
+            load_kw["torch_dtype"] = torch.float16
+        if config.get("device_map"):
+            load_kw["device_map"] = config["device_map"]
+        model = AutoModel.from_pretrained(model_name, **load_kw)
+        if not config.get("device_map"):
+            model = model.to(device)
+        model = model.eval()
 
-        model = (AutoModel.from_pretrained(model_name, **load_kw).to(device).eval())
-
-        n_chunks = math.ceil(len(remaining_df) / BINOMIAL_CHUNK_SIZE)
+        chunk_sz = config.get("chunk_size", BINOMIAL_CHUNK_SIZE)
+        n_chunks = math.ceil(len(remaining_df) / chunk_sz)
         for chunk_idx in range(n_chunks):
             chunk_df = remaining_df.iloc[
-                chunk_idx * BINOMIAL_CHUNK_SIZE:(chunk_idx + 1) * BINOMIAL_CHUNK_SIZE
+                chunk_idx * chunk_sz:(chunk_idx + 1) * chunk_sz
             ]
             chunk_df = chunk_df[
                 ~chunk_df["phrase_AB"].apply(
@@ -819,7 +832,8 @@ def _process_checkpoint(
         if model is not None:
             del model
         torch.cuda.empty_cache()
-        shutil.rmtree(tmp_cache, ignore_errors=True)
+        if tmp_cache:
+            shutil.rmtree(tmp_cache, ignore_errors=True)
 
 
 def _load_tokenizer(config: Dict):
@@ -888,12 +902,21 @@ def main():
             ckpts = log_sample_checkpoints(ckpts, n=N_LOG_CHECKPOINTS)
             for ckpt in ckpts:
                 if ckpt_done_counts.get((model_name, ckpt["checkpoint"]), 0) >= n_binomials:
-                    continue  # all binomials done for this checkpoint
+                    continue
                 all_jobs.append({
                     "model_name": model_name,
                     "ckpt":       ckpt,
                     "weight":     config["job_weight"],
                 })
+
+        for model_name, config in EXTRA_MODEL_CONFIGS.items():
+            if ckpt_done_counts.get((model_name, "final"), 0) >= n_binomials:
+                continue
+            all_jobs.append({
+                "model_name": model_name,
+                "ckpt":       {"checkpoint": "final", "tag": None, "step": 0, "tokens": 0},
+                "weight":     config.get("job_weight", 10.0),
+            })
 
         if not all_jobs:
             print("  All checkpoints already complete — nothing to do.")
@@ -1000,7 +1023,7 @@ def main():
                 sorted(my_jobs, key=lambda j: (j["weight"], j["model_name"])),
                 key=lambda j: j["model_name"],
             ):
-                config = MODEL_CONFIGS[model_name]
+                config = MODEL_CONFIGS.get(model_name) or EXTRA_MODEL_CONFIGS[model_name]
                 print(f"\n{'='*60}")
                 print(f"Model: {model_name}  [{config['size_label']}]  (GPU {args.gpu})")
                 print("=" * 60)
@@ -1029,6 +1052,19 @@ def main():
                         binoms_df, phrase_sentence_map, completed,
                         device, writer, out_file,
                     )
+
+            # Extra models (OLMo etc.) — final checkpoint only
+            for model_name, config in EXTRA_MODEL_CONFIGS.items():
+                print(f"\n{'='*60}")
+                print(f"Model: {model_name}  [{config['size_label']}]  (final checkpoint only)")
+                print("=" * 60)
+                tokenizer = _load_tokenizer(config)
+                _process_checkpoint(
+                    model_name, config,
+                    {"checkpoint": "final", "tag": None, "step": 0, "tokens": 0},
+                    tokenizer, binoms_df, phrase_sentence_map, completed,
+                    device, writer, out_file,
+                )
     finally:
         out_file.close()
 

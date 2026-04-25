@@ -118,7 +118,8 @@ proc <- proc_raw %>%
     log_freq_sc  = sc(log_freq),
     ord_dom      = abs(rel_freq - 0.5),
     ord_dom_sc   = sc(ord_dom),
-    proc_sc      = sc(procrustes_dist),
+    proc_sc           = sc(procrustes_dist),
+    mean_consistency  = (-self_sim_AB + -self_sim_BA) / 2,
     log_freq_bin = cut(log_freq, breaks = 3,
                        labels = c("Low freq", "Mid freq", "High freq")),
     ord_dom_bin  = factor(
@@ -192,6 +193,38 @@ proc %>%
                       name = "Ordering dominance") +
   labs(x = "log(overall frequency)", y = "Procrustes distance",
        title = "Frequency × ordering dominance interaction (Procrustes)") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+```{r proc-viz-partial, fig.height=5}
+# Residualise procrustes_dist on mean_consistency within each model,
+# then plot against log_freq × ordering dominance.
+.d <- proc %>%
+  filter(!is.na(ord_dom_bin), !is.na(mean_consistency)) %>%
+  group_by(model_size) %>%
+  mutate(proc_resid = residuals(lm(procrustes_dist ~ mean_consistency))) %>%
+  ungroup()
+
+.sm <- fit_smart_smooth(.d, "log_freq", "proc_resid",
+                        group_cols = c("model_size", "ord_dom_bin"))
+
+.d %>%
+  ggplot(aes(x = log_freq, y = proc_resid,
+             colour = ord_dom_bin, fill = ord_dom_bin)) +
+  geom_point(alpha = 0.2, size = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_ribbon(data = .sm, aes(x = log_freq, ymin = .lwr, ymax = .upr,
+                               fill = ord_dom_bin),
+              inherit.aes = FALSE, alpha = 0.2) +
+  geom_line(data = .sm, aes(x = log_freq, y = .fit, colour = ord_dom_bin),
+            inherit.aes = FALSE, linewidth = 0.8) +
+  facet_wrap(~model_size, nrow = 1, scales = "free_x") +
+  scale_colour_brewer(palette = "Set2", aesthetics = c("colour", "fill"),
+                      name = "Ordering dominance") +
+  labs(x = "log(overall frequency)",
+       y = "Procrustes distance (self-similarity residualised)",
+       title = "Frequency × ordering dominance, self-similarity partialled out") +
   theme_minimal() +
   theme(legend.position = "bottom")
 ```

@@ -32,16 +32,26 @@ OUT_CSV    = str(Path(__file__).resolve().parent.parent / "Data" / "infinigram_f
 
 API_URL    = "https://api.infini-gram.io/"
 CORPUS     = "v4_dolma-v1_7_llama"   # Dolma v1.7, LLaMA tokenizer
-SLEEP_SEC  = 0.1                      # polite delay between requests
-MAX_RETRY  = 3
+SLEEP_SEC      = 0.1   # polite delay between requests
+MAX_RETRY      = 3
+RETRY_403      = 5     # extra retries specifically for 403 rate-limit responses
+RETRY_403_WAIT = 60    # seconds to wait before each 403 retry
 
 
 def query_count(text: str) -> int:
     """Return the count of `text` as an exact n-gram in CORPUS."""
     payload = {"corpus": CORPUS, "query_type": "count", "query": text}
+    forbidden_attempts = 0
     for attempt in range(MAX_RETRY):
         try:
             resp = requests.post(API_URL, json=payload, timeout=30)
+            if resp.status_code == 403 and forbidden_attempts < RETRY_403:
+                forbidden_attempts += 1
+                print(f"  403 Forbidden for '{text}' "
+                      f"(attempt {forbidden_attempts}/{RETRY_403}) — "
+                      f"waiting {RETRY_403_WAIT}s ...")
+                time.sleep(RETRY_403_WAIT)
+                continue
             resp.raise_for_status()
             return int(resp.json().get("count", 0))
         except Exception as e:

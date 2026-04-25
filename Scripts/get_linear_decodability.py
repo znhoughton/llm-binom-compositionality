@@ -19,7 +19,6 @@ Usage:
 
 import argparse
 import csv
-import math
 import os
 import shutil
 import sys
@@ -40,7 +39,7 @@ from transformers import AutoModel
 # ---------------------------------------------------------------------------
 sys.path.insert(0, str(Path(__file__).parent))
 from binomial_rep_analysis import (
-    BINOMS_CSV, MODEL_CONFIGS, BINOMIAL_CHUNK_SIZE, DEFAULT_BATCH_SIZE,
+    BINOMS_CSV, MODEL_CONFIGS, DEFAULT_BATCH_SIZE,
     N_LOG_CHECKPOINTS, PROJECT_ROOT,
     load_binomials, collect_sentences, extract_representations,
     get_model_checkpoints, log_sample_checkpoints, _load_tokenizer,
@@ -90,7 +89,7 @@ def open_output(path: str):
 # ---------------------------------------------------------------------------
 def _logreg_cv_one(A_arr: np.ndarray, B_arr: np.ndarray, n: int):
     """
-    PCA + 10-fold stratified CV logistic regression for one binomial.
+    StandardScaler + 10-fold stratified CV logistic regression for one binomial.
     Called in parallel across binomials via joblib.
 
     A_arr: (>=n, D) — AB-order representations
@@ -131,93 +130,84 @@ def process_checkpoint(
             load_kw["revision"] = ckpt["tag"]
         model = AutoModel.from_pretrained(model_name, **load_kw).to(device).eval()
 
-        n_chunks = math.ceil(len(binoms_df) / BINOMIAL_CHUNK_SIZE)
-        for chunk_idx in range(n_chunks):
-            chunk_df = binoms_df.iloc[
-                chunk_idx * BINOMIAL_CHUNK_SIZE:(chunk_idx + 1) * BINOMIAL_CHUNK_SIZE
-            ]
-            chunk_map = {
-                phrase: phrase_sentence_map[phrase]
-                for _, row in chunk_df.iterrows()
-                for phrase in (row["phrase_AB"], row["phrase_BA"])
-            }
+        all_map = {
+            phrase: phrase_sentence_map[phrase]
+            for _, row in binoms_df.iterrows()
+            for phrase in (row["phrase_AB"], row["phrase_BA"])
+        }
 
-            print(f"  Extracting chunk {chunk_idx + 1}/{n_chunks} ...")
-            chunk_reps = extract_representations(
-                model, tokenizer, chunk_map, device,
-                batch_size=config.get("batch_size", DEFAULT_BATCH_SIZE),
+        print(f"  Extracting representations for all binomials ...")
+        all_reps = extract_representations(
+            model, tokenizer, all_map, device,
+            batch_size=config.get("batch_size", DEFAULT_BATCH_SIZE),
+        )
+
+        all_layers = sorted({
+            layer
+            for _, row in binoms_df.iterrows()
+            for layer in (
+                set(all_reps.get(row["phrase_AB"], {})) &
+                set(all_reps.get(row["phrase_BA"], {}))
+            )
+        })
+        if layers_filter == "last":
+            all_layers = [max(all_layers)] if all_layers else []
+        elif layers_filter is not None:
+            keep = {int(x) for x in layers_filter.split(",")}
+            all_layers = [l for l in all_layers if l in keep]
+
+        for layer_idx in tqdm(all_layers, desc="  Layers", position=0):
+            pending = [
+                (row["phrase_AB"],
+                 all_reps[row["phrase_AB"]][layer_idx],
+                 all_reps[row["phrase_BA"]][layer_idx])
+                for _, row in binoms_df.iterrows()
+                if (model_name, ckpt["checkpoint"], row["phrase_AB"], layer_idx)
+                   not in completed
+                and layer_idx in all_reps.get(row["phrase_AB"], {})
+                and layer_idx in all_reps.get(row["phrase_BA"], {})
+            ]
+            if not pending:
+                continue
+
+            abs_list = [p[0] for p in pending]
+            A_arrs   = [p[1] for p in pending]
+            B_arrs   = [p[2] for p in pending]
+            n = min(
+                min(len(a) for a in A_arrs),
+                min(len(b) for b in B_arrs),
+            )
+            if n < N_FOLDS * 2:
+                continue
+
+            tqdm.write(f"    layer {layer_idx:>2d}: "
+                       f"{len(pending)} binomials, n={n} sentences")
+
+            results = Parallel(n_jobs=N_JOBS)(
+                delayed(_logreg_cv_one)(A_arrs[i], B_arrs[i], n)
+                for i in tqdm(range(len(pending)),
+                              desc=f"      binomials (layer {layer_idx})",
+                              position=1, leave=False)
             )
 
-            # Determine which layers to score
-            all_layers = sorted({
-                layer
-                for _, row in chunk_df.iterrows()
-                for layer in (
-                    set(chunk_reps.get(row["phrase_AB"], {})) &
-                    set(chunk_reps.get(row["phrase_BA"], {}))
-                )
-            })
-            if layers_filter == "last":
-                all_layers = [max(all_layers)] if all_layers else []
-            elif layers_filter is not None:
-                keep = {int(x) for x in layers_filter.split(",")}
-                all_layers = [l for l in all_layers if l in keep]
-
-            for layer_idx in tqdm(all_layers, desc="  Layers", position=0):
-                # Collect all pending binomials for this layer
-                pending = [
-                    (row["phrase_AB"],
-                     chunk_reps[row["phrase_AB"]][layer_idx],
-                     chunk_reps[row["phrase_BA"]][layer_idx])
-                    for _, row in chunk_df.iterrows()
-                    if (model_name, ckpt["checkpoint"], row["phrase_AB"], layer_idx)
-                       not in completed
-                    and layer_idx in chunk_reps.get(row["phrase_AB"], {})
-                    and layer_idx in chunk_reps.get(row["phrase_BA"], {})
-                ]
-                if not pending:
+            for ab, (logits, labels) in zip(abs_list, results):
+                if logits is None:
                     continue
+                completed.add((model_name, ckpt["checkpoint"], ab, layer_idx))
+                for logit, label in zip(logits, labels):
+                    writer.writerow({
+                        "model":      model_name,
+                        "model_size": size_label,
+                        "checkpoint": ckpt["checkpoint"],
+                        "step":       ckpt["step"],
+                        "tokens":     ckpt["tokens"],
+                        "phrase_AB":  ab,
+                        "layer":      layer_idx,
+                        "label":      int(label),
+                        "logit":      float(logit),
+                    })
 
-                abs_list = [p[0] for p in pending]
-                A_arrs   = [p[1] for p in pending]
-                B_arrs   = [p[2] for p in pending]
-                n = min(
-                    min(len(a) for a in A_arrs),
-                    min(len(b) for b in B_arrs),
-                )
-                if n < N_FOLDS * 2:
-                    continue
-
-                tqdm.write(f"    layer {layer_idx:>2d}: "
-                           f"{len(pending)} binomials, n={n} sentences")
-
-                results = Parallel(n_jobs=N_JOBS)(
-                    delayed(_logreg_cv_one)(A_arrs[i], B_arrs[i], n)
-                    for i in tqdm(range(len(pending)),
-                                  desc=f"      binomials (layer {layer_idx})",
-                                  position=1, leave=False)
-                )
-
-                for ab, (logits, labels) in zip(abs_list, results):
-                    if logits is None:
-                        continue
-                    completed.add((model_name, ckpt["checkpoint"], ab, layer_idx))
-                    for logit, label in zip(logits, labels):
-                        writer.writerow({
-                            "model":      model_name,
-                            "model_size": size_label,
-                            "checkpoint": ckpt["checkpoint"],
-                            "step":       ckpt["step"],
-                            "tokens":     ckpt["tokens"],
-                            "phrase_AB":  ab,
-                            "layer":      layer_idx,
-                            "label":      int(label),
-                            "logit":      float(logit),
-                        })
-
-                out_file.flush()
-
-            del chunk_reps
+            out_file.flush()
 
         print(f"  Done.")
 

@@ -230,9 +230,16 @@ proc_sizes %>%
 proc_brms <- proc_sizes %>%
   set_names() %>%
   map(function(size) {
+    d <- proc %>%
+      filter(model_size == size) %>%
+      mutate(
+        proc_sc     = sc(procrustes_dist),
+        log_freq_sc = sc(log_freq),
+        ord_dom_sc  = sc(ord_dom)
+      )
     brm(
       proc_sc ~ log_freq_sc * ord_dom_sc,
-      data   = proc %>% filter(model_size == size),
+      data   = d,
       prior  = base_priors,
       family = gaussian(),
       cores  = 4, iter = 2000, seed = 42,
@@ -416,9 +423,16 @@ cos_sizes %>%
 cos_brms <- cos_sizes %>%
   set_names() %>%
   map(function(size) {
+    d <- cos %>%
+      filter(model_size == size) %>%
+      mutate(
+        cos_sc      = sc(cosine_sim),
+        log_freq_sc = sc(log_freq),
+        ord_dom_sc  = sc(ord_dom)
+      )
     brm(
       cos_sc ~ log_freq_sc * ord_dom_sc,
-      data   = cos %>% filter(model_size == size),
+      data   = d,
       prior  = base_priors,
       family = gaussian(),
       cores  = 4, iter = 2000, seed = 42,
@@ -614,9 +628,16 @@ comp_sizes %>%
 comp_brms <- comp_sizes %>%
   set_names() %>%
   map(function(size) {
+    d <- comp %>%
+      filter(model_size == size) %>%
+      mutate(
+        LogCosSim_sc = sc(LogCosSim),
+        log_freq_sc  = sc(log_freq),
+        relfreq_c    = rel_freq - 0.5   # fixed theoretical centering, not mean-centered
+      )
     brm(
       LogCosSim_sc ~ log_freq_sc * relfreq_c,
-      data   = comp %>% filter(model_size == size),
+      data   = d,
       prior  = base_priors,
       family = gaussian(),
       cores  = 4, iter = 2000, seed = 42,

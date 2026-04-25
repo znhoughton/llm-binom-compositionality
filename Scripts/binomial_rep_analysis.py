@@ -97,7 +97,8 @@ MODEL_CONFIGS = {
         "tokens_per_step": 409_600,
         "tokenizer":       "znhoughton/opt-babylm-1.3b-20eps-seed964",
         "size_label":      "1.3b",
-        "batch_size":      512,   # reduced from 2048; OOM fallback will halve further if needed
+        "batch_size":      512,
+        "chunk_size":      50,    # limits reps dict to ~50 binomials at a time; prevents OOM in cosine/compositional scripts
         "job_weight":      26.0,
     },
 }

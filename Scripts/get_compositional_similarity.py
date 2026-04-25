@@ -3,19 +3,17 @@
 get_compositional_similarity.py
 ---------------------------------
 For each attested binomial, computes the mean cosine similarity between:
-  - In-context rep:  mean over phrase-span tokens extracted from full sentence contexts
-  - Isolated rep:    mean over all non-special tokens when the phrase is run alone
+  - Holistic rep:      mean over phrase-span tokens (w1, "and", w2) extracted from
+                       full sentence contexts
+  - Compositional rep: mean of w1, "and", w2 embedded individually with no context
 
-  High cosine_sim -> context does not strongly change the phrase representation
-  Low cosine_sim  -> phrase representation is heavily modulated by sentence context
-
-This is a measure of compositionality / context-invariance. If the model represents
-"men and women" the same way regardless of what surrounds it, it is treating the
-phrase as a stable, compositional unit. If the surrounding context strongly shifts
-the representation, the phrase is being interpreted more holistically/idiomatically.
+  High cosine_sim -> holistic representation is close to the simple word average
+                     (compositional / context-invariant)
+  Low cosine_sim  -> holistic representation departs from the word average
+                     (idiomatic / context-enriched)
 
 Both orderings (AB and BA) are scored separately, so the analysis can test whether
-preferred orderings have more stable (or more context-sensitive) representations.
+preferred orderings are represented more or less compositionally than dispreferred ones.
 
 Output: Data/compositional_similarity.csv
 
@@ -88,10 +86,10 @@ def open_output(path: str):
 
 
 # ---------------------------------------------------------------------------
-# ISOLATED PHRASE REPRESENTATIONS
+# COMPOSITIONAL REPRESENTATIONS (individual word embeddings)
 # ---------------------------------------------------------------------------
 @torch.inference_mode()
-def extract_isolated_representations(
+def extract_compositional_representations(
     model,
     tokenizer,
     phrases: List[str],
@@ -99,25 +97,28 @@ def extract_isolated_representations(
     batch_size: int = DEFAULT_BATCH_SIZE,
 ) -> Dict[str, Dict[int, np.ndarray]]:
     """
-    Embed each phrase in isolation (no surrounding sentence context) and return
-    the mean of all non-special tokens' hidden states at each layer.
+    For each phrase "w1 and w2", embed each of the three words independently
+    (separate forward passes, no surrounding context) and return the mean of
+    their hidden states at each layer as the compositional representation.
 
-    Prepends a space so BPE tokenization matches the mid-sentence form used in
-    extract_representations (e.g. "Ġmen" rather than "men").
+    Prepends a space to each word so BPE tokenization matches the mid-sentence
+    form used in extract_representations (e.g. "Ġmen" rather than "men").
 
     Returns {phrase: {layer_idx: np.ndarray of shape (D,)}}
     """
-    results: Dict[str, Dict[int, np.ndarray]] = {p: {} for p in phrases}
+    # Collect unique words across all phrases and embed them independently
+    all_words = sorted({word for phrase in phrases for word in phrase.split()})
 
-    for start in range(0, len(phrases), batch_size):
-        batch_phrases = phrases[start:start + batch_size]
-        batch_texts = [" " + p for p in batch_phrases]
+    word_reps: Dict[str, Dict[int, np.ndarray]] = {}
+    for start in range(0, len(all_words), batch_size):
+        batch_words = all_words[start:start + batch_size]
+        batch_texts = [" " + w for w in batch_words]
 
         enc = tokenizer(
             batch_texts,
             padding=True,
             truncation=True,
-            max_length=512,
+            max_length=64,
             return_tensors="pt",
             return_offsets_mapping=True,
         )
@@ -128,17 +129,27 @@ def extract_isolated_representations(
         outputs = model(**enc, output_hidden_states=True)
 
         for layer_idx, layer_h in enumerate(outputs.hidden_states):
-            layer_np = layer_h.float().cpu().numpy()  # (B, T, D)
-            for b_idx, phrase in enumerate(batch_phrases):
+            layer_np = layer_h.float().cpu().numpy()
+            for b_idx, word in enumerate(batch_words):
                 offsets = offset_mappings[b_idx]
-                # Keep only real (non-padding, non-special) tokens
                 valid = [
                     j for j, (cs, ce) in enumerate(offsets)
                     if attn_mask[b_idx][j] == 1 and cs != ce
                 ]
                 if not valid:
                     continue
-                results[phrase][layer_idx] = layer_np[b_idx, valid, :].mean(axis=0)
+                word_reps.setdefault(word, {})[layer_idx] = \
+                    layer_np[b_idx, valid, :].mean(axis=0)
+
+    # Average individual word representations to form each phrase's compositional rep
+    results: Dict[str, Dict[int, np.ndarray]] = {}
+    for phrase in phrases:
+        words = phrase.split()
+        shared_layers = set.intersection(*(set(word_reps.get(w, {})) for w in words))
+        results[phrase] = {
+            layer_idx: np.stack([word_reps[w][layer_idx] for w in words]).mean(axis=0)
+            for layer_idx in shared_layers
+        }
 
     return results
 
@@ -146,14 +157,14 @@ def extract_isolated_representations(
 # ---------------------------------------------------------------------------
 # COSINE SIMILARITY (many rows vs one vector)
 # ---------------------------------------------------------------------------
-def contextual_vs_isolated_cosine(
-    ctx: np.ndarray,  # (n, D) — one row per sentence
-    iso: np.ndarray,  # (D,)   — single isolated rep
+def holistic_vs_compositional_cosine(
+    holistic: np.ndarray,      # (n, D) — one row per sentence
+    compositional: np.ndarray, # (D,)   — single compositional rep
 ) -> np.ndarray:
-    """Per-sentence cosine similarity between contextual reps and isolated rep."""
-    ctx_norm = ctx / np.linalg.norm(ctx, axis=1, keepdims=True).clip(min=1e-10)
-    iso_norm = iso / max(np.linalg.norm(iso), 1e-10)
-    return ctx_norm @ iso_norm  # (n,)
+    """Per-sentence cosine similarity between holistic reps and compositional rep."""
+    h_norm = holistic / np.linalg.norm(holistic, axis=1, keepdims=True).clip(min=1e-10)
+    c_norm = compositional / max(np.linalg.norm(compositional), 1e-10)
+    return h_norm @ c_norm  # (n,)
 
 
 # ---------------------------------------------------------------------------
@@ -205,8 +216,8 @@ def process_checkpoint(
                 batch_size=config.get("batch_size", DEFAULT_BATCH_SIZE),
             )
 
-            print(f"  Extracting isolated representations ...")
-            iso_reps = extract_isolated_representations(
+            print(f"  Extracting compositional representations ...")
+            comp_reps = extract_compositional_representations(
                 model, tokenizer, all_phrases, device,
                 batch_size=config.get("batch_size", DEFAULT_BATCH_SIZE),
             )
@@ -214,7 +225,7 @@ def process_checkpoint(
             all_layers = sorted({
                 layer
                 for p in all_phrases
-                for layer in set(ctx_reps.get(p, {})) & set(iso_reps.get(p, {}))
+                for layer in set(ctx_reps.get(p, {})) & set(comp_reps.get(p, {}))
             })
             if layers_filter == "last":
                 all_layers = [max(all_layers)] if all_layers else []
@@ -232,12 +243,12 @@ def process_checkpoint(
                             continue
                         if layer_idx not in ctx_reps.get(phrase, {}):
                             continue
-                        if layer_idx not in iso_reps.get(phrase, {}):
+                        if layer_idx not in comp_reps.get(phrase, {}):
                             continue
 
-                        ctx = ctx_reps[phrase][layer_idx]  # (n, D)
-                        iso = iso_reps[phrase][layer_idx]  # (D,)
-                        sims = contextual_vs_isolated_cosine(ctx, iso)
+                        ctx  = ctx_reps[phrase][layer_idx]   # (n, D)
+                        comp = comp_reps[phrase][layer_idx]  # (D,)
+                        sims = holistic_vs_compositional_cosine(ctx, comp)
                         mean_sim = float(sims.mean())
 
                         completed.add(key)
@@ -255,7 +266,7 @@ def process_checkpoint(
 
                 out_file.flush()
 
-            del ctx_reps, iso_reps
+            del ctx_reps, comp_reps
 
         print(f"  Done.")
 

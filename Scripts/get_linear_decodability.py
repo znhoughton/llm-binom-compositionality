@@ -1,4 +1,4 @@
-Okay#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 get_linear_decodability.py
 --------------------------
@@ -13,6 +13,8 @@ Output: Data/linear_decodability.csv
 
 Usage:
     python Scripts/get_linear_decodability.py --layers last --n-checkpoints 1
+    python Scripts/get_linear_decodability.py \\
+        --checkpoints-from results/binomial_representations.csv --layers last
 """
 
 import argparse
@@ -25,10 +27,10 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+from joblib import Parallel, delayed
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedKFold, cross_val_predict
-from sklearn.pipeline import Pipeline
 from tqdm import tqdm
 import torch
 from transformers import AutoModel
@@ -56,6 +58,7 @@ FIELDNAMES = [
 
 N_FOLDS     = 10    # stratified k-fold splits
 N_PCA_COMPS = 100   # PCA components before logistic regression
+N_JOBS      = 12    # joblib workers for parallel logistic regression
 
 
 # ---------------------------------------------------------------------------
@@ -86,31 +89,30 @@ def open_output(path: str):
 # ---------------------------------------------------------------------------
 # DECODABILITY
 # ---------------------------------------------------------------------------
-def get_fold_predictions(A: np.ndarray, B: np.ndarray):
+def _logreg_cv_one(A_arr: np.ndarray, B_arr: np.ndarray, n: int):
     """
-    10-fold stratified CV for one (binomial, layer).
-    Returns (logits, labels) — one entry per held-out test example across all
-    folds — so the caller can write one row per sentence to the output CSV.
+    PCA + 10-fold stratified CV logistic regression for one binomial.
+    Called in parallel across binomials via joblib.
 
-    A: (n_AB, D) AB representations  (label 0)
-    B: (n_BA, D) BA representations  (label 1)
+    A_arr: (>=n, D) — AB-order representations
+    B_arr: (>=n, D) — BA-order representations
 
-    PCA is fitted inside each training fold to prevent leakage.
-    Returns (None, None) if too few samples.
+    Returns (logits, y) or (None, None) if too few samples.
     """
-    n = min(len(A), len(B))
     if n < N_FOLDS * 2:
         return None, None
 
-    X = np.concatenate([A[:n], B[:n]], axis=0)       # (2n, D)
-    y = np.array([0] * n + [1] * n, dtype=np.int32)  # 0=AB, 1=BA
+    X = np.vstack([A_arr[:n], B_arr[:n]])
+    X = X - X.mean(axis=0)
 
-    pipe = Pipeline([
-        ("pca", PCA(n_components=min(N_PCA_COMPS, n - 1))),
-        ("clf", LogisticRegression(C=1.0, max_iter=1000, solver="lbfgs")),
-    ])
+    K = min(N_PCA_COMPS, n - 1)
+    X_proj = PCA(n_components=K).fit_transform(X)
+
+    y      = np.array([0] * n + [1] * n, dtype=np.int32)
+    clf    = LogisticRegression(C=1.0, max_iter=1000, solver="lbfgs")
     cv     = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
-    logits = cross_val_predict(pipe, X, y, cv=cv, method="decision_function")
+    logits = cross_val_predict(clf, X_proj, y, cv=cv,
+                               method="decision_function", n_jobs=1)
     return logits, y
 
 
@@ -168,41 +170,62 @@ def process_checkpoint(
                 all_layers = [l for l in all_layers if l in keep]
 
             for layer_idx in tqdm(all_layers, desc="  Layers", position=0):
-                rows = list(chunk_df.iterrows())
-                with tqdm(rows, desc=f"    layer {layer_idx:>2d}  binomials",
-                          position=1, leave=False) as binom_bar:
-                    for _, row in binom_bar:
-                        ab, ba = row["phrase_AB"], row["phrase_BA"]
-                        binom_bar.set_postfix_str(ab, refresh=False)
-                        if (model_name, ckpt["checkpoint"], ab, layer_idx) in completed:
-                            continue
-                        reps_ab = chunk_reps.get(ab, {}).get(layer_idx)
-                        reps_ba = chunk_reps.get(ba, {}).get(layer_idx)
-                        if reps_ab is None or reps_ba is None:
-                            continue
+                # Collect all pending binomials for this layer
+                pending = [
+                    (row["phrase_AB"],
+                     chunk_reps[row["phrase_AB"]][layer_idx],
+                     chunk_reps[row["phrase_BA"]][layer_idx])
+                    for _, row in chunk_df.iterrows()
+                    if (model_name, ckpt["checkpoint"], row["phrase_AB"], layer_idx)
+                       not in completed
+                    and layer_idx in chunk_reps.get(row["phrase_AB"], {})
+                    and layer_idx in chunk_reps.get(row["phrase_BA"], {})
+                ]
+                if not pending:
+                    continue
 
-                        logits, labels = get_fold_predictions(reps_ab, reps_ba)
-                        if logits is None:
-                            continue
-                        completed.add((model_name, ckpt["checkpoint"], ab, layer_idx))
-                        for logit, label in zip(logits, labels):
-                            writer.writerow({
-                                "model":      model_name,
-                                "model_size": size_label,
-                                "checkpoint": ckpt["checkpoint"],
-                                "step":       ckpt["step"],
-                                "tokens":     ckpt["tokens"],
-                                "phrase_AB":  ab,
-                                "layer":      layer_idx,
-                                "label":      int(label),
-                                "logit":      float(logit),
-                            })
+                abs_list = [p[0] for p in pending]
+                A_arrs   = [p[1] for p in pending]
+                B_arrs   = [p[2] for p in pending]
+                n = min(
+                    min(len(a) for a in A_arrs),
+                    min(len(b) for b in B_arrs),
+                )
+                if n < N_FOLDS * 2:
+                    continue
+
+                tqdm.write(f"    layer {layer_idx:>2d}: "
+                           f"{len(pending)} binomials, n={n} sentences")
+
+                results = Parallel(n_jobs=N_JOBS)(
+                    delayed(_logreg_cv_one)(A_arrs[i], B_arrs[i], n)
+                    for i in tqdm(range(len(pending)),
+                                  desc=f"      binomials (layer {layer_idx})",
+                                  position=1, leave=False)
+                )
+
+                for ab, (logits, labels) in zip(abs_list, results):
+                    if logits is None:
+                        continue
+                    completed.add((model_name, ckpt["checkpoint"], ab, layer_idx))
+                    for logit, label in zip(logits, labels):
+                        writer.writerow({
+                            "model":      model_name,
+                            "model_size": size_label,
+                            "checkpoint": ckpt["checkpoint"],
+                            "step":       ckpt["step"],
+                            "tokens":     ckpt["tokens"],
+                            "phrase_AB":  ab,
+                            "layer":      layer_idx,
+                            "label":      int(label),
+                            "logit":      float(logit),
+                        })
 
                 out_file.flush()
 
             del chunk_reps
 
-        print(f"  ✅ Done.")
+        print(f"  Done.")
 
     finally:
         if model is not None:
@@ -272,12 +295,11 @@ def main():
 
     out_file, writer = open_output(OUT_CSV)
 
-    # Build per-model checkpoint list.
     if args.checkpoints_from:
         print(f"\nReading checkpoints from {args.checkpoints_from} ...")
         ckpts_by_model = _checkpoints_from_csv(args.checkpoints_from)
     else:
-        ckpts_by_model = None   # will sample below
+        ckpts_by_model = None
 
     try:
         for model_name, config in MODEL_CONFIGS.items():

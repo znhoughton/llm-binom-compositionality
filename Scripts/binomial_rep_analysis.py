@@ -801,7 +801,10 @@ def _process_checkpoint(
 
 
 def _load_tokenizer(config: Dict):
-    tok = AutoTokenizer.from_pretrained(config["tokenizer"], use_fast=True)
+    tok = AutoTokenizer.from_pretrained(
+        config["tokenizer"], use_fast=True,
+        trust_remote_code=config.get("trust_remote_code", False),
+    )
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     tok.padding_side = "right"

@@ -113,6 +113,8 @@ def process_checkpoint(
         if ckpt["tag"]:
             load_kw["revision"] = ckpt["tag"]
             load_kw["cache_dir"] = tmp_cache
+        if config.get("trust_remote_code"):
+            load_kw["trust_remote_code"] = True
         model = AutoModel.from_pretrained(model_name, **load_kw).to(device).eval()
 
         all_map = {
@@ -233,6 +235,10 @@ def main():
         "--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
         help=f"Batch size for --model (default {DEFAULT_BATCH_SIZE}).",
     )
+    parser.add_argument(
+        "--trust-remote-code", action="store_true",
+        help="Pass trust_remote_code=True to from_pretrained (needed for some models e.g. OLMo).",
+    )
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -258,9 +264,10 @@ def main():
     if args.model:
         models_to_run = {
             args.model: {
-                "size_label": args.size_label or args.model,
-                "batch_size": args.batch_size,
-                "tokenizer":  args.model,
+                "size_label":        args.size_label or args.model,
+                "batch_size":        args.batch_size,
+                "tokenizer":         args.model,
+                "trust_remote_code": args.trust_remote_code,
             }
         }
         ckpts_override = {

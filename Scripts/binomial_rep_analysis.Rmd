@@ -9,7 +9,7 @@ output:
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
-                      fig.width = 9, fig.height = 5)
+                      fig.width = 10, fig.height = 5)
 ```
 
 ## Setup
@@ -19,741 +19,567 @@ library(tidyverse)
 library(brms)
 library(tidybayes)
 library(patchwork)
+library(broom)
 ```
 
 ```{r load-data}
-df_raw <- read_csv("../results/binomial_representations.csv")
+MODEL_LEVELS <- c("125m", "350m", "1.3b", "olmo-1b", "olmo-7b")
 
-# Replace web-corpus frequency estimates with counts from the BabyLM training
-# corpus (produced by Scripts/get_corpus_freqs.py).
-corpus_freqs <- read_csv("../Data/babylm_corpus_freqs.csv") %>%
-  select(phrase_AB, corpus_freq = overall_freq, corpus_rel_freq = rel_freq,
-         freq_AB, freq_BA)
+# Frequency data: BabyLM corpus for small models, Dolma (infini-gram) for OLMo
+babylm_freqs <- read_csv("../Data/babylm_corpus_freqs.csv") %>%
+  select(phrase_AB, overall_freq, rel_freq)
 
-df_raw <- df_raw %>%
-  select(-overall_freq, -rel_freq) %>%
-  left_join(corpus_freqs, by = "phrase_AB")
+infinigram_freqs <- read_csv("../Data/infinigram_freqs.csv") %>%
+  select(phrase_AB, overall_freq, rel_freq)
 
-# Each row is one (model × checkpoint × binomial × layer) observation.
-# self_sim_AB is always ≤ 0: closer to 0 = more consistent across contexts.
-# procrustes_dist is normalised residual of Procrustes(AB → BA): lower = better alignment.
-glimpse(df_raw)
+# Outcome data
+proc_raw <- read_csv("../results/binomial_representations.csv") %>%
+  select(-any_of(c("overall_freq", "rel_freq")))
+
+cos_raw  <- read_csv("../Data/cosine_similarity.csv")
+comp_raw <- read_csv("../Data/compositional_similarity.csv")
 ```
 
-## Data Preparation
+```{r helpers}
+# Join the right frequency table based on model_size
+join_freqs <- function(df) {
+  bind_rows(
+    df %>%
+      filter(model_size %in% c("125m", "350m", "1.3b")) %>%
+      left_join(babylm_freqs, by = "phrase_AB"),
+    df %>%
+      filter(model_size %in% c("olmo-1b", "olmo-7b")) %>%
+      left_join(infinigram_freqs, by = "phrase_AB")
+  )
+}
 
-```{r prep}
-# Keep only the last layer per model (most processed representation).
-# 125m: layer 12, 350m/1.3b: layer 24.
-last_layer <- df_raw %>%
-  group_by(model_size) %>%
-  summarise(last_layer = max(layer), .groups = "drop")
+# Keep only the final checkpoint × last layer per model
+filter_final <- function(df) {
+  df %>%
+    group_by(model_size) %>%
+    filter(tokens == max(tokens), layer == max(layer)) %>%
+    ungroup()
+}
 
-df <- df_raw %>%
-  left_join(last_layer, by = "model_size") %>%
-  filter(layer == last_layer) %>%
-  select(-last_layer) %>%
+sc <- function(x) as.vector(scale(x))
+
+# Shared brms priors for all Gaussian models
+base_priors <- c(
+  prior(normal(0, 1),   class = b),
+  prior(normal(0, 1),   class = Intercept),
+  prior(exponential(1), class = sigma)
+)
+```
+
+---
+
+## Procrustes Distance
+
+Procrustes distance between the AB and BA representation clouds at the final
+checkpoint, last layer. Lower distance = model treats both orderings similarly;
+higher distance = ordering changes the representation substantially.
+
+**Predictors:**
+- `log_freq`: log overall corpus frequency
+- `ord_dom = |RelFreq − 0.5|`: ordering dominance (0 = equally frequent in both orders, 0.5 = only one order attested)
+
+```{r proc-prep}
+proc <- proc_raw %>%
+  mutate(model_size = factor(model_size, levels = MODEL_LEVELS)) %>%
+  filter_final() %>%
+  join_freqs() %>%
+  filter(!is.na(overall_freq), overall_freq > 0,
+         !is.na(rel_freq), !is.na(procrustes_dist)) %>%
   mutate(
-    log_freq        = log1p(corpus_freq),   # log1p handles any zero-count binomials
-    log_tokens      = log(tokens),
-    # Zero-corpus binomials get rel_freq = 0.5 (no ordering evidence either way)
-    corpus_rel_freq = if_else(is.na(corpus_rel_freq), 0.5, corpus_rel_freq),
-    # Negate self_sim so higher = more consistent (easier to interpret)
-    consistency      = -self_sim_AB,
-    consistency_BA   = -self_sim_BA,
-    mean_consistency = (consistency + consistency_BA) / 2,
-    model_size  = factor(model_size, levels = c("125m", "350m", "1.3b", "olmo-1b", "olmo-7b"))
+    log_freq     = log(overall_freq),
+    log_freq_sc  = sc(log_freq),
+    ord_dom      = abs(rel_freq - 0.5),
+    ord_dom_sc   = sc(ord_dom),
+    proc_sc      = sc(procrustes_dist),
+    log_freq_bin = cut(log_freq, breaks = 3,
+                       labels = c("Low freq", "Mid freq", "High freq")),
+    ord_dom_bin  = cut(ord_dom,
+                       breaks = quantile(ord_dom, c(0, 1/3, 2/3, 1), na.rm = TRUE),
+                       labels = c("Balanced", "Moderate", "Dominant"),
+                       include.lowest = TRUE),
+    model_size   = factor(model_size, levels = MODEL_LEVELS)
   )
 
-# Label early / mid / final checkpoints per model
-checkpoint_labels <- df %>%
-  distinct(model_size, step, tokens) %>%
-  group_by(model_size) %>%
-  arrange(step) %>%
-  mutate(ckpt_label = case_when(
-    row_number() == 1              ~ "early",
-    row_number() == n()            ~ "final",
-    row_number() == round(n() / 2) ~ "mid",
-    TRUE                           ~ NA_character_
-  )) %>%
-  filter(!is.na(ckpt_label)) %>%
-  ungroup()
-
-df_labeled <- df %>%
-  left_join(checkpoint_labels %>% select(model_size, step, ckpt_label),
-            by = c("model_size", "step"))
-
-cat("Rows per checkpoint label:\n")
-print(count(df_labeled %>% filter(!is.na(ckpt_label)), model_size, ckpt_label, step))
+proc_sizes <- levels(droplevels(proc$model_size))
+cat("Models:", paste(proc_sizes, collapse = ", "), "\n")
+cat("N per model:\n"); print(count(proc, model_size))
 ```
 
-## Visualisations
+### Visualizations
 
-### Procrustes distance vs consistency at final checkpoint
-
-```{r viz-consistency, fig.height=4}
-df_final <- df_labeled %>% filter(ckpt_label == "final")
-
-ggplot(df_final, aes(x = consistency, y = procrustes_dist, colour = model_size)) +
-  geom_point(alpha = 0.25, size = 0.8) +
-  geom_smooth(method = "lm", se = TRUE) +
-  facet_wrap(~model_size, scales = "free_x") +
-  scale_colour_brewer(palette = "Set1", guide = "none") +
-  labs(
-    x     = "Consistency (−self_sim_AB; higher = more consistent)",
-    y     = "Procrustes distance",
-    title = "Procrustes distance vs representation consistency (final checkpoint, last layer)"
-  ) +
-  theme_minimal()
+```{r proc-viz-freq, fig.height=5}
+proc %>%
+  ggplot(aes(x = log_freq, y = procrustes_dist, colour = ord_dom)) +
+  geom_point(alpha = 0.4, size = 0.9) +
+  geom_smooth(method = "lm", colour = "black", linewidth = 0.8) +
+  facet_wrap(~model_size, nrow = 1, scales = "free_x") +
+  scale_colour_viridis_c(name = "Ordering dominance\n|RelFreq − 0.5|") +
+  labs(x = "log(overall frequency)", y = "Procrustes distance",
+       title = "Procrustes distance vs frequency (final checkpoint, last layer)") +
+  theme_minimal() +
+  theme(legend.position = "right")
 ```
 
-### Procrustes distance vs overall frequency across checkpoints
-
-```{r viz-freq, fig.height=9}
-df_labeled %>%
-  filter(!is.na(ckpt_label), corpus_freq > 0) %>%
-  mutate(ckpt_label = factor(ckpt_label, levels = c("early", "mid", "final"))) %>%
-  ggplot(aes(x = log_freq, y = procrustes_dist, colour = model_size)) +
-  geom_point(alpha = 0.25, size = 0.8) +
+```{r proc-viz-ord, fig.height=5}
+proc %>%
+  ggplot(aes(x = ord_dom, y = procrustes_dist, colour = log_freq_bin)) +
+  geom_point(alpha = 0.4, size = 0.9) +
   geom_smooth(method = "lm", se = TRUE) +
-  facet_grid(ckpt_label ~ model_size) +
-  scale_colour_brewer(palette = "Set1", guide = "none") +
-  labs(
-    x     = "log(overall frequency)",
-    y     = "Procrustes distance",
-    title = "Procrustes distance vs corpus frequency (last layer)"
-  ) +
-  theme_minimal()
-```
-
-### Interaction of overall frequency × relative frequency on Procrustes distance
-
-Binomials split into high/low relative frequency (median split within each model),
-then Procrustes distance plotted against log overall frequency.
-High rel_freq = AB order dominant; low rel_freq = BA order dominant.
-
-```{r viz-freq-relfreq-interaction, fig.height=9}
-df_labeled %>%
-  filter(!is.na(ckpt_label), corpus_freq > 0, !is.na(corpus_rel_freq)) %>%
-  mutate(
-    ckpt_label = factor(ckpt_label, levels = c("early", "mid", "final")),
-    rel_freq_group = if_else(corpus_rel_freq >= 0.5, "AB-dominant (rel_freq ≥ 0.5)",
-                                                      "BA-dominant (rel_freq < 0.5)")
-  ) %>%
-  ggplot(aes(x = log_freq, y = procrustes_dist,
-             colour = rel_freq_group, fill = rel_freq_group)) +
-  geom_point(alpha = 0.2, size = 0.8) +
-  geom_smooth(method = "lm", se = TRUE) +
-  facet_grid(ckpt_label ~ model_size) +
-  scale_colour_brewer(palette = "Set2", aesthetics = c("colour", "fill")) +
-  labs(
-    x      = "log(overall frequency)",
-    y      = "Procrustes distance",
-    colour = "Ordering preference",
-    fill   = "Ordering preference",
-    title  = "Procrustes distance: overall freq × relative freq interaction (last layer)"
-  ) +
+  facet_wrap(~model_size, nrow = 1) +
+  scale_colour_brewer(palette = "Blues", name = "Frequency tertile") +
+  labs(x = "Ordering dominance |RelFreq − 0.5|", y = "Procrustes distance",
+       title = "Procrustes distance vs ordering dominance") +
   theme_minimal() +
   theme(legend.position = "bottom")
 ```
 
-### Predictor correlation: consistency vs frequency
-
-```{r viz-pred-corr, fig.height=4}
-ggplot(df_final, aes(x = log_freq, y = consistency, colour = model_size)) +
-  geom_point(alpha = 0.2, size = 0.8) +
+```{r proc-viz-interaction, fig.height=5}
+proc %>%
+  filter(!is.na(ord_dom_bin)) %>%
+  ggplot(aes(x = log_freq, y = procrustes_dist,
+             colour = ord_dom_bin, fill = ord_dom_bin)) +
+  geom_point(alpha = 0.2, size = 0.7) +
   geom_smooth(method = "lm", se = TRUE) +
-  facet_wrap(~model_size, scales = "free_y") +
-  scale_colour_brewer(palette = "Set1", guide = "none") +
-  labs(
-    x = "log(overall frequency)",
-    y = "Consistency (−self_sim_AB)",
-    title = "Predictor correlation: consistency vs frequency"
-  ) +
-  theme_minimal()
+  facet_wrap(~model_size, nrow = 1, scales = "free_x") +
+  scale_colour_brewer(palette = "Set2", aesthetics = c("colour", "fill"),
+                      name = "Ordering dominance") +
+  labs(x = "log(overall frequency)", y = "Procrustes distance",
+       title = "Frequency × ordering dominance interaction (Procrustes)") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
 ```
 
-### Procrustes distance vs frequency (mean consistency partialled out)
+### OLS Coefficients
 
-Residualises `procrustes_dist` on `mean_consistency` (average of AB and BA
-self-similarity) within each model, then plots the residuals against log
-frequency. A negative slope here means the frequency effect survives after
-controlling for both cloud's representational stability.
-
-```{r viz-partial-resid, fig.height=4}
-df_final %>%
-  filter(corpus_freq > 0) %>%
-  group_by(model_size) %>%
-  mutate(proc_resid = residuals(lm(procrustes_dist ~ mean_consistency))) %>%
-  ungroup() %>%
-  ggplot(aes(x = log_freq, y = proc_resid, colour = model_size)) +
-  geom_point(alpha = 0.25, size = 0.8) +
-  geom_smooth(method = "lm", se = TRUE) +
-  facet_wrap(~model_size, scales = "free_x") +
-  scale_colour_brewer(palette = "Set1", guide = "none") +
-  labs(
-    x     = "log(overall frequency)",
-    y     = "Procrustes distance (residual after mean consistency)",
-    title = "Procrustes distance vs frequency, mean consistency partialled out (final checkpoint, last layer)"
-  ) +
-  theme_minimal()
-```
-
-### Frequency effect from joint OLS model (mean consistency held constant)
-
-Fits `lm(procrustes_dist ~ cons_c + freq_c)` separately per model size with
-both predictors mean-centred. The regression line shows predicted Procrustes
-distance across the observed frequency range at mean consistency (`cons_c = 0`),
-so the slope is mathematically the frequency effect holding consistency constant.
-Points are partial residuals that remove the fitted consistency contribution, so
-their scatter aligns with the line.
-
-```{r viz-freq-lm-adjusted, fig.height=4}
-models_adj <- df_final %>%
-  filter(corpus_freq > 0) %>%
-  group_by(model_size) %>%
-  nest() %>%
+```{r proc-lm-coef, fig.height=4}
+proc_sizes %>%
+  set_names() %>%
+  map_dfr(function(size) {
+    lm(procrustes_dist ~ log_freq_sc * ord_dom_sc,
+       data = proc %>% filter(model_size == size)) %>%
+      tidy(conf.int = TRUE) %>%
+      filter(term != "(Intercept)")
+  }, .id = "model_size") %>%
   mutate(
-    data_c = map(data, ~ .x %>% mutate(
-      cons_c = mean_consistency - mean(mean_consistency),
-      freq_c = log_freq         - mean(log_freq)
-    )),
-    fit = map(data_c, ~ lm(procrustes_dist ~ cons_c + freq_c, data = .x))
-  )
-
-pred_lines <- models_adj %>%
-  mutate(preds = map2(fit, data_c, ~ {
-    grid <- tibble(freq_c = seq(min(.y$freq_c), max(.y$freq_c), length.out = 200),
-                   cons_c = 0) %>%
-      mutate(log_freq = freq_c + mean(.y$log_freq))
-    bind_cols(grid, as_tibble(predict(.x, newdata = grid, interval = "confidence")))
-  })) %>%
-  select(model_size, preds) %>%
-  unnest(preds)
-
-pts_adj <- models_adj %>%
-  mutate(pts = map2(fit, data_c, ~ {
-    b <- coef(.x)["cons_c"]
-    .y %>% mutate(proc_adj = procrustes_dist - b * cons_c)
-  })) %>%
-  select(model_size, pts) %>%
-  unnest(pts)
-
-ggplot() +
-  geom_point(data = pts_adj,
-             aes(x = log_freq, y = proc_adj, colour = model_size),
-             alpha = 0.2, size = 0.8) +
-  geom_ribbon(data = pred_lines,
-              aes(x = log_freq, ymin = lwr, ymax = upr, fill = model_size),
-              alpha = 0.25) +
-  geom_line(data = pred_lines,
-            aes(x = log_freq, y = fit, colour = model_size),
-            linewidth = 0.9) +
-  facet_wrap(~model_size, scales = "free_x") +
-  scale_colour_brewer(palette = "Set1", guide = "none") +
-  scale_fill_brewer(palette = "Set1", guide = "none") +
-  labs(
-    x     = "log(overall frequency)",
-    y     = "Procrustes distance (partial)",
-    title = "Frequency effect at mean consistency — joint OLS model (final checkpoint, last layer)"
-  ) +
-  theme_minimal()
-```
-
-### Effect of frequency on Procrustes distance across layers
-
-Spearman correlation between log corpus frequency and Procrustes distance
-computed at each layer, at the final checkpoint. Positive = higher-frequency
-binomials have higher Procrustes distance (more dissimilar ordering representations);
-negative = higher-frequency binomials have more similar ordering representations.
-
-```{r viz-freq-by-layer, fig.height=4}
-# Use full dataset (all layers), filtered to final checkpoint per model
-final_steps <- checkpoint_labels %>% filter(ckpt_label == "final") %>%
-  select(model_size, step)
-
-df_all_layers_final <- df_raw %>%
-  semi_join(final_steps, by = c("model_size", "step")) %>%
-  mutate(
-    log_freq   = log1p(corpus_freq),
-    model_size = factor(model_size, levels = c("125m", "350m", "1.3b", "olmo-1b", "olmo-7b")),
-    layer_prop = layer / max(layer),   # normalise within each row (max varies by model)
-  )
-
-# Recompute per-model layer_prop correctly
-df_all_layers_final <- df_all_layers_final %>%
-  group_by(model_size) %>%
-  mutate(layer_prop = layer / max(layer)) %>%
-  ungroup()
-
-# Spearman correlation between log_freq and procrustes_dist at each layer × model
-freq_layer_cor <- df_all_layers_final %>%
-  group_by(model_size, layer, layer_prop) %>%
-  summarise(
-    r = cor(log_freq, procrustes_dist, method = "spearman", use = "complete.obs"),
-    .groups = "drop"
-  )
-
-ggplot(freq_layer_cor, aes(x = layer_prop, y = r, colour = model_size)) +
-  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
-  geom_line(linewidth = 0.9) +
-  geom_point(size = 2) +
-  scale_colour_brewer(palette = "Set1") +
-  scale_x_continuous(labels = scales::percent) +
-  labs(
-    x      = "Layer (% of total depth)",
-    y      = "Spearman r (log freq vs Procrustes distance)",
-    title  = "Effect of corpus frequency on Procrustes distance across layers (final checkpoint)",
-    colour = "Model"
-  ) +
-  theme_minimal()
-```
-
-### Procrustes distance across training
-
-```{r viz-training, fig.height=5}
-df_avg <- df %>%
-  group_by(model_size, log_tokens) %>%
-  summarise(mean_proc = mean(procrustes_dist),
-            se_proc   = sd(procrustes_dist) / sqrt(n()),
-            .groups   = "drop")
-
-ggplot(df_avg, aes(x = log_tokens, y = mean_proc,
-                   colour = model_size, fill = model_size)) +
-  geom_ribbon(aes(ymin = mean_proc - se_proc,
-                  ymax = mean_proc + se_proc), alpha = 0.2, colour = NA) +
-  geom_line(linewidth = 0.8) +
-  scale_colour_brewer(palette = "Set1") +
-  scale_fill_brewer(palette = "Set1") +
-  labs(
-    x      = "log(tokens seen)",
-    y      = "Mean Procrustes distance",
-    title  = "Procrustes distance over training (last layer, mean ± SE across binomials)",
-    colour = "Model", fill = "Model"
-  ) +
-  theme_minimal()
-```
-
-### Procrustes distance across layers
-
-Mean Procrustes distance at each layer for the early, mid, and final checkpoints.
-Shows how word-order sensitivity builds across network depth and whether that
-layer-profile changes over training.
-
-```{r viz-proc-by-layer, fig.height=4}
-df_raw %>%
-  inner_join(checkpoint_labels %>% select(model_size, step, ckpt_label),
-             by = c("model_size", "step")) %>%
-  mutate(
-    model_size = factor(model_size, levels = c("125m", "350m", "1.3b", "olmo-1b", "olmo-7b")),
-    ckpt_label = factor(ckpt_label, levels = c("early", "mid", "final"))
+    model_size = factor(model_size, levels = MODEL_LEVELS),
+    term = recode(term,
+                  log_freq_sc              = "log freq",
+                  ord_dom_sc               = "ordering dominance",
+                  `log_freq_sc:ord_dom_sc` = "freq × dom")
   ) %>%
-  group_by(model_size, ckpt_label, layer) %>%
-  summarise(mean_proc = mean(procrustes_dist), .groups = "drop") %>%
-  ggplot(aes(x = layer, y = mean_proc, colour = ckpt_label)) +
-  geom_line(linewidth = 0.9) +
-  geom_point(size = 1.5) +
-  facet_wrap(~model_size, scales = "free_x") +
-  scale_colour_brewer(palette = "Set2") +
-  labs(
-    x      = "Layer",
-    y      = "Mean Procrustes distance",
-    title  = "Procrustes distance across layers (early / mid / final checkpoints)",
-    colour = "Checkpoint"
-  ) +
+  ggplot(aes(x = estimate, xmin = conf.low, xmax = conf.high,
+             y = term, colour = model_size)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  geom_pointrange(position = position_dodge(width = 0.5), linewidth = 0.8) +
+  scale_colour_brewer(palette = "Set1", name = "Model") +
+  labs(x = "OLS estimate (95% CI)", y = NULL,
+       title = "Procrustes distance: OLS coefficients per model") +
   theme_minimal()
 ```
 
-### Procrustes distance across layers by frequency quartile
+### brms Models
 
-Layer profile split by corpus-frequency quartile at the final checkpoint.
-Shows whether the layer at which word-order representations diverge differs
-for high vs low frequency binomials.
-
-```{r viz-proc-layer-freq, fig.height=4}
-df_raw %>%
-  semi_join(
-    checkpoint_labels %>% filter(ckpt_label == "final") %>% select(model_size, step),
-    by = c("model_size", "step")
-  ) %>%
-  filter(corpus_freq > 0) %>%
-  mutate(
-    model_size    = factor(model_size, levels = c("125m", "350m", "1.3b")),
-    freq_quartile = ntile(corpus_freq, 4),
-    freq_label    = factor(
-      case_when(
-        freq_quartile == 1 ~ "Q1 (low freq)",
-        freq_quartile == 2 ~ "Q2",
-        freq_quartile == 3 ~ "Q3",
-        freq_quartile == 4 ~ "Q4 (high freq)"
-      ),
-      levels = c("Q1 (low freq)", "Q2", "Q3", "Q4 (high freq)")
-    )
-  ) %>%
-  group_by(model_size, layer, freq_label) %>%
-  summarise(mean_proc = mean(procrustes_dist), .groups = "drop") %>%
-  ggplot(aes(x = layer, y = mean_proc, colour = freq_label)) +
-  geom_line(linewidth = 0.9) +
-  geom_point(size = 1.5) +
-  facet_wrap(~model_size, scales = "free_x") +
-  scale_colour_viridis_d(option = "plasma", end = 0.85) +
-  labs(
-    x      = "Layer",
-    y      = "Mean Procrustes distance",
-    title  = "Procrustes distance across layers by frequency quartile (final checkpoint)",
-    colour = "Frequency quartile"
-  ) +
-  theme_minimal()
-```
-
-### Procrustes distance over training by frequency quartile
-
-Training trajectory split by corpus-frequency quartile (last layer).
-Shows whether high-frequency binomials develop more order-sensitive
-representations earlier in training than low-frequency ones.
-
-```{r viz-proc-training-freq, fig.height=4}
-df %>%
-  filter(corpus_freq > 0) %>%
-  mutate(
-    freq_quartile = ntile(corpus_freq, 4),
-    freq_label    = factor(
-      case_when(
-        freq_quartile == 1 ~ "Q1 (low freq)",
-        freq_quartile == 2 ~ "Q2",
-        freq_quartile == 3 ~ "Q3",
-        freq_quartile == 4 ~ "Q4 (high freq)"
-      ),
-      levels = c("Q1 (low freq)", "Q2", "Q3", "Q4 (high freq)")
-    )
-  ) %>%
-  group_by(model_size, log_tokens, freq_label) %>%
-  summarise(mean_proc = mean(procrustes_dist), .groups = "drop") %>%
-  ggplot(aes(x = log_tokens, y = mean_proc, colour = freq_label)) +
-  geom_line(linewidth = 0.9) +
-  geom_point(size = 1.5) +
-  facet_wrap(~model_size) +
-  scale_colour_viridis_d(option = "plasma", end = 0.85) +
-  labs(
-    x      = "log(tokens seen)",
-    y      = "Mean Procrustes distance",
-    title  = "Procrustes distance over training by frequency quartile (last layer)",
-    colour = "Frequency quartile"
-  ) +
-  theme_minimal()
-```
-
-## brms Models
-
-All models are fit separately per LLM (125m, 350m, 1.3b).
-
-Outcome: `procrustes_dist`.
-Predictors: `mean_consistency` (average of −self_sim_AB and −self_sim_BA) and `log_freq`, both scaled within each model fit.
-Random effect: `(1 | phrase_AB)`.
-Family: Gaussian (beta regression would be more principled for a 0–1 outcome but is a reasonable starting point).
-
-```{r brms-priors}
-priors_base <- c(
-  prior(normal(0, 1),   class = b),
-  prior(normal(0.5, 1), class = Intercept),
-  prior(exponential(1), class = sd),
-  prior(exponential(1), class = sigma)
-)
-
-model_sizes <- c("125m", "350m", "1.3b")
-```
-
-### Checkpoint-specific models (early / mid / final)
-
-One model per LLM per timepoint — 9 models total, cached to disk.
-
-```{r brms-checkpoint-models, results="hide"}
-formula_base <- procrustes_dist ~ cons_sc * freq_sc + (1 | phrase_AB)
-
-# Returns a named list: list(early = m, mid = m, final = m) for one model size
-fit_ckpt_models <- function(size) {
-  map(c("early", "mid", "final"), function(label) {
-    d <- df_labeled %>%
-      filter(model_size == size, ckpt_label == label) %>%
-      mutate(cons_sc = as.vector(scale(mean_consistency)),
-             freq_sc = as.vector(scale(log_freq)))
-
+```{r proc-brms-fit, results="hide"}
+proc_brms <- proc_sizes %>%
+  set_names() %>%
+  map(function(size) {
     brm(
-      formula_base,
-      data   = d,
-      prior  = priors_base,
+      proc_sc ~ log_freq_sc * ord_dom_sc,
+      data   = proc %>% filter(model_size == size),
+      prior  = base_priors,
       family = gaussian(),
-      cores  = 4,
-      iter   = 2000,
-      seed   = 42,
-      file   = sprintf("../results/m_%s_%s", size, label)
+      cores  = 4, iter = 2000, seed = 42,
+      file   = sprintf("../results/m_proc_%s", size)
     )
-  }) %>% set_names(c("early", "mid", "final"))
-}
-
-ckpt_models <- map(model_sizes, fit_ckpt_models) %>% set_names(model_sizes)
-```
-
-```{r checkpoint-summaries}
-iwalk(ckpt_models, function(size_models, size) {
-  iwalk(size_models, function(m, label) {
-    cat(sprintf("\n=== %s — %s checkpoint ===\n", size, label))
-    print(summary(m))
   })
-})
 ```
 
-```{r checkpoint-coef-plot, fig.height=8}
-coef_df <- imap_dfr(ckpt_models, function(size_models, size) {
-  imap_dfr(size_models, function(m, label) {
+```{r proc-brms-coef, fig.height=4}
+proc_brms %>%
+  imap_dfr(function(m, size) {
     as_draws_df(m) %>%
       select(starts_with("b_"), -b_Intercept) %>%
       pivot_longer(everything(), names_to = "term", values_to = "estimate") %>%
-      mutate(checkpoint = label, model_size = size)
-  })
-}) %>%
+      mutate(model_size = size)
+  }) %>%
   mutate(
-    checkpoint = factor(checkpoint, levels = c("early", "mid", "final")),
-    model_size = factor(model_size, levels = model_sizes)
-  )
-
-ggplot(coef_df, aes(x = estimate, y = term, fill = checkpoint)) +
-  stat_halfeye(position = position_dodge(width = 0.6), alpha = 0.7) +
+    model_size = factor(model_size, levels = MODEL_LEVELS),
+    term = recode(term,
+                  b_log_freq_sc              = "log freq",
+                  b_ord_dom_sc               = "ordering dominance",
+                  `b_log_freq_sc:ord_dom_sc` = "freq × dom")
+  ) %>%
+  ggplot(aes(x = estimate, y = term, fill = model_size)) +
+  stat_halfeye(position = position_dodge(width = 0.6), alpha = 0.8) +
   geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
-  facet_wrap(~model_size, ncol = 1) +
-  scale_fill_brewer(palette = "Set2") +
-  labs(
-    x     = "Posterior estimate",
-    y     = NULL,
-    title = "Coefficients across early / mid / final checkpoints, per LLM",
-    fill  = "Checkpoint"
-  ) +
+  scale_fill_brewer(palette = "Set1", name = "Model") +
+  labs(x = "Posterior estimate", y = NULL,
+       title = "Procrustes distance: Bayesian model coefficients") +
   theme_minimal()
 ```
 
-### Full model: effect of training progress (all checkpoints)
-
-```{r brms-full-models, results="hide"}
-formula_full <- procrustes_dist ~ cons_sc * freq_sc * log_tokens_sc + (1 | phrase_AB)
-
-fit_full_model <- function(size) {
-  d <- df %>%
-    filter(model_size == size) %>%
-    mutate(cons_sc       = as.vector(scale(mean_consistency)),
-           freq_sc       = as.vector(scale(log_freq)),
-           log_tokens_sc = as.vector(scale(log_tokens)))
-
-  brm(
-    formula_full,
-    data   = d,
-    prior  = c(
-      prior(normal(0, 1),   class = b),
-      prior(normal(0.5, 1), class = Intercept),
-      prior(exponential(1), class = sd),
-      prior(exponential(1), class = sigma)
-    ),
-    family = gaussian(),
-    cores  = 4,
-    iter   = 2000,
-    seed   = 42,
-    file   = sprintf("../results/m_%s_full", size)
-  )
-}
-
-full_models <- map(model_sizes, fit_full_model) %>% set_names(model_sizes)
-```
-
-```{r full-summaries}
-iwalk(full_models, function(m, size) {
-  cat(sprintf("\n=== %s — full model ===\n", size))
-  print(summary(m))
-})
-```
-
-```{r full-coef-plot, fig.height=7}
-imap_dfr(full_models, function(m, size) {
-  as_draws_df(m) %>%
-    select(starts_with("b_"), -b_Intercept) %>%
-    pivot_longer(everything(), names_to = "term", values_to = "estimate") %>%
-    mutate(model_size = size)
-}) %>%
-  mutate(model_size = factor(model_size, levels = model_sizes)) %>%
-  ggplot(aes(x = estimate, y = term)) +
-  stat_halfeye(fill = "#4393c3", alpha = 0.8) +
-  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
-  facet_wrap(~model_size, ncol = 1) +
-  labs(
-    x     = "Posterior estimate",
-    y     = NULL,
-    title = "Full model coefficients (all checkpoints), per LLM"
-  ) +
-  theme_minimal()
-```
-
-### Conditional effects: consistency × frequency (final checkpoint)
-
-```{r cond-effects, fig.height=4}
-plots <- map(model_sizes, function(size) {
+```{r proc-cond-effects, fig.height=4}
+map(proc_sizes, function(size) {
   ce <- conditional_effects(
-    ckpt_models[[size]][["final"]],
-    effects    = "cons_sc:freq_sc",
-    re_formula = NA
-  )
-  plot(ce, plot = FALSE)[[1]] +
-    labs(title = size, x = "Consistency (scaled)", y = "Procrustes distance") +
-    theme_minimal()
-})
-
-wrap_plots(plots, nrow = 1) +
-  plot_annotation(title = "Consistency × frequency interaction at final checkpoint")
-```
-
-## Compositional Similarity
-
-How similar is the model's holistic representation of each binomial (in sentence
-context) to the mean of its constituent words embedded individually?
-`LogCosSim = log(cos_α / cos_¬α)` where `cos_α` is the cosine similarity between
-the in-context AB-ordering representation and the compositional (word-average)
-representation, and `cos_¬α` is the same for the BA ordering.
-Positive LogCosSim = the AB ordering is more compositionally predictable.
-
-```{r comp-sim-load}
-comp_sim_raw <- read_csv("../Data/compositional_similarity.csv")
-
-binoms_freq <- read_csv("../Data/nonce_and_attested_binoms.csv") %>%
-  filter(Attested == 1) %>%
-  mutate(phrase_AB = paste(tolower(Word1), "and", tolower(Word2))) %>%
-  select(phrase_AB, OverallFreq, RelFreq)
-
-comp_wide <- comp_sim_raw %>%
-  group_by(model) %>%
-  filter(layer == max(layer), tokens == max(tokens)) %>%
-  ungroup() %>%
-  pivot_wider(names_from = ordering, values_from = mean_cosine_sim,
-              names_prefix = "comp_sim_") %>%
-  left_join(binoms_freq, by = "phrase_AB") %>%
-  filter(!is.na(OverallFreq), OverallFreq > 0,
-         comp_sim_AB > 0, comp_sim_BA > 0) %>%
-  mutate(
-    LogCosSim       = log(comp_sim_AB / comp_sim_BA),
-    LogCosSim_sc    = as.vector(scale(LogCosSim)),
-    log_freq_c      = as.vector(scale(log(OverallFreq))),
-    RelFreq_recoded = RelFreq - 0.5,
-    relfreq_bin     = cut(RelFreq_recoded,
-                          breaks = quantile(RelFreq_recoded, c(0, 1/3, 2/3, 1), na.rm = TRUE),
-                          labels = c("BA-dominant", "Balanced", "AB-dominant"),
-                          include.lowest = TRUE),
-    model_size      = factor(model_size,
-                             levels = c("125m", "350m", "1.3b", "olmo-1b", "olmo-7b"))
-  )
-
-comp_model_sizes <- levels(droplevels(comp_wide$model_size))
-cat("Models in compositional similarity data:", paste(comp_model_sizes, collapse = ", "), "\n")
-```
-
-### Visualisations
-
-```{r comp-sim-viz, fig.height=8}
-p_freq <- comp_wide %>%
-  ggplot(aes(x = log_freq_c, y = LogCosSim, colour = relfreq_bin)) +
-  geom_point(alpha = 0.3, size = 0.8) +
-  geom_smooth(method = "lm", se = TRUE) +
-  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
-  facet_wrap(~model_size, nrow = 1) +
-  scale_colour_brewer(palette = "RdBu", direction = -1) +
-  labs(
-    x      = "log(Overall frequency) [centered]",
-    y      = "LogCosSim",
-    colour = "Relative frequency",
-    title  = "LogCosSim by overall frequency (last layer, final checkpoint)"
-  ) +
-  theme_minimal() +
-  theme(legend.position = "bottom")
-
-p_relfreq <- comp_wide %>%
-  ggplot(aes(x = RelFreq_recoded, y = LogCosSim, colour = relfreq_bin)) +
-  geom_point(alpha = 0.3, size = 0.8) +
-  geom_smooth(method = "lm", se = TRUE) +
-  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
-  facet_wrap(~model_size, nrow = 1) +
-  scale_colour_brewer(palette = "RdBu", direction = -1, guide = "none") +
-  labs(
-    x     = "Relative frequency (−0.5 = always BA, +0.5 = always AB)",
-    y     = "LogCosSim",
-    title = "LogCosSim by relative frequency"
-  ) +
-  theme_minimal()
-
-p_freq / p_relfreq
-```
-
-### brms Models: LogCosSim ~ OverallFreq × RelFreq
-
-One model per LLM. Outcome: `LogCosSim` scaled to mean 0, SD 1.
-Predictors: `log(OverallFreq)` centered and scaled, `RelFreq` recoded to −0.5–0.5.
-
-```{r comp-sim-brms-fit, results="hide"}
-comp_priors <- c(
-  prior(normal(0, 1), class = b),
-  prior(normal(0, 1), class = Intercept),
-  prior(exponential(1), class = sigma)
-)
-
-comp_models <- map(comp_model_sizes, function(size) {
-  d <- comp_wide %>% filter(model_size == size)
-  brm(
-    LogCosSim_sc ~ log_freq_c * RelFreq_recoded,
-    data   = d,
-    prior  = comp_priors,
-    family = gaussian(),
-    cores  = 4,
-    iter   = 2000,
-    seed   = 42,
-    file   = sprintf("../results/m_comp_%s", size)
-  )
-}) %>% set_names(comp_model_sizes)
-```
-
-```{r comp-sim-brms-summaries}
-iwalk(comp_models, function(m, size) {
-  cat(sprintf("\n=== %s ===\n", size))
-  print(summary(m))
-})
-```
-
-```{r comp-sim-coef-plot, fig.height=5}
-imap_dfr(comp_models, function(m, size) {
-  as_draws_df(m) %>%
-    select(starts_with("b_"), -b_Intercept) %>%
-    pivot_longer(everything(), names_to = "term", values_to = "estimate") %>%
-    mutate(model_size = size)
-}) %>%
-  mutate(model_size = factor(model_size, levels = comp_model_sizes)) %>%
-  ggplot(aes(x = estimate, y = term)) +
-  stat_halfeye(fill = "#4393c3", alpha = 0.8) +
-  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
-  facet_wrap(~model_size, nrow = 1) +
-  labs(
-    x     = "Posterior estimate",
-    y     = NULL,
-    title = "LogCosSim model coefficients per LLM (OverallFreq × RelFreq)"
-  ) +
-  theme_minimal()
-```
-
-```{r comp-sim-cond-effects, fig.height=4}
-ce_plots <- map(comp_model_sizes, function(size) {
-  ce <- conditional_effects(
-    comp_models[[size]],
-    effects = "log_freq_c:RelFreq_recoded"
+    proc_brms[[size]],
+    effects = "log_freq_sc:ord_dom_sc"
   )
   plot(ce, plot = FALSE)[[1]] +
     labs(title = size,
-         x     = "log(freq) [centered]",
-         y     = "LogCosSim [scaled]") +
+         x = "log freq [scaled]", y = "Procrustes dist [scaled]") +
     theme_minimal()
-})
+}) %>%
+  wrap_plots(nrow = 1) +
+  plot_annotation(title = "Conditional effects: frequency × ordering dominance (Procrustes)")
+```
 
-wrap_plots(ce_plots, nrow = 1) +
-  plot_annotation(title = "Interaction: overall frequency × relative frequency on LogCosSim")
+---
+
+## In-Context Cosine Similarity (AB vs BA)
+
+Cosine similarity between matched AB and BA phrase representations extracted in
+sentence context. High similarity = model treats both orderings alike; low
+similarity = ordering substantially changes the representation.
+
+**Predictors:** same as Procrustes — log frequency and ordering dominance.
+
+```{r cos-prep}
+cos <- cos_raw %>%
+  mutate(model_size = factor(model_size, levels = MODEL_LEVELS)) %>%
+  group_by(model, model_size, checkpoint, step, tokens, phrase_AB, layer) %>%
+  summarise(cosine_sim = mean(cosine_sim, na.rm = TRUE), .groups = "drop") %>%
+  filter_final() %>%
+  join_freqs() %>%
+  filter(!is.na(overall_freq), overall_freq > 0,
+         !is.na(rel_freq), !is.na(cosine_sim)) %>%
+  mutate(
+    log_freq     = log(overall_freq),
+    log_freq_sc  = sc(log_freq),
+    ord_dom      = abs(rel_freq - 0.5),
+    ord_dom_sc   = sc(ord_dom),
+    cos_sc       = sc(cosine_sim),
+    log_freq_bin = cut(log_freq, breaks = 3,
+                       labels = c("Low freq", "Mid freq", "High freq")),
+    ord_dom_bin  = cut(ord_dom,
+                       breaks = quantile(ord_dom, c(0, 1/3, 2/3, 1), na.rm = TRUE),
+                       labels = c("Balanced", "Moderate", "Dominant"),
+                       include.lowest = TRUE),
+    model_size   = factor(model_size, levels = MODEL_LEVELS)
+  )
+
+cos_sizes <- levels(droplevels(cos$model_size))
+cat("Models:", paste(cos_sizes, collapse = ", "), "\n")
+cat("N per model:\n"); print(count(cos, model_size))
+```
+
+### Visualizations
+
+```{r cos-viz-freq, fig.height=5}
+cos %>%
+  ggplot(aes(x = log_freq, y = cosine_sim, colour = ord_dom)) +
+  geom_point(alpha = 0.4, size = 0.9) +
+  geom_smooth(method = "lm", colour = "black", linewidth = 0.8) +
+  facet_wrap(~model_size, nrow = 1, scales = "free_x") +
+  scale_colour_viridis_c(name = "Ordering dominance\n|RelFreq − 0.5|") +
+  labs(x = "log(overall frequency)", y = "Cosine similarity (AB vs BA)",
+       title = "In-context cosine similarity vs frequency (final checkpoint, last layer)") +
+  theme_minimal() +
+  theme(legend.position = "right")
+```
+
+```{r cos-viz-ord, fig.height=5}
+cos %>%
+  ggplot(aes(x = ord_dom, y = cosine_sim, colour = log_freq_bin)) +
+  geom_point(alpha = 0.4, size = 0.9) +
+  geom_smooth(method = "lm", se = TRUE) +
+  facet_wrap(~model_size, nrow = 1) +
+  scale_colour_brewer(palette = "Blues", name = "Frequency tertile") +
+  labs(x = "Ordering dominance |RelFreq − 0.5|", y = "Cosine similarity (AB vs BA)",
+       title = "In-context cosine similarity vs ordering dominance") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+```{r cos-viz-interaction, fig.height=5}
+cos %>%
+  filter(!is.na(ord_dom_bin)) %>%
+  ggplot(aes(x = log_freq, y = cosine_sim,
+             colour = ord_dom_bin, fill = ord_dom_bin)) +
+  geom_point(alpha = 0.2, size = 0.7) +
+  geom_smooth(method = "lm", se = TRUE) +
+  facet_wrap(~model_size, nrow = 1, scales = "free_x") +
+  scale_colour_brewer(palette = "Set2", aesthetics = c("colour", "fill"),
+                      name = "Ordering dominance") +
+  labs(x = "log(overall frequency)", y = "Cosine similarity (AB vs BA)",
+       title = "Frequency × ordering dominance interaction (cosine similarity)") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+### OLS Coefficients
+
+```{r cos-lm-coef, fig.height=4}
+cos_sizes %>%
+  set_names() %>%
+  map_dfr(function(size) {
+    lm(cosine_sim ~ log_freq_sc * ord_dom_sc,
+       data = cos %>% filter(model_size == size)) %>%
+      tidy(conf.int = TRUE) %>%
+      filter(term != "(Intercept)")
+  }, .id = "model_size") %>%
+  mutate(
+    model_size = factor(model_size, levels = MODEL_LEVELS),
+    term = recode(term,
+                  log_freq_sc              = "log freq",
+                  ord_dom_sc               = "ordering dominance",
+                  `log_freq_sc:ord_dom_sc` = "freq × dom")
+  ) %>%
+  ggplot(aes(x = estimate, xmin = conf.low, xmax = conf.high,
+             y = term, colour = model_size)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  geom_pointrange(position = position_dodge(width = 0.5), linewidth = 0.8) +
+  scale_colour_brewer(palette = "Set1", name = "Model") +
+  labs(x = "OLS estimate (95% CI)", y = NULL,
+       title = "Cosine similarity: OLS coefficients per model") +
+  theme_minimal()
+```
+
+### brms Models
+
+```{r cos-brms-fit, results="hide"}
+cos_brms <- cos_sizes %>%
+  set_names() %>%
+  map(function(size) {
+    brm(
+      cos_sc ~ log_freq_sc * ord_dom_sc,
+      data   = cos %>% filter(model_size == size),
+      prior  = base_priors,
+      family = gaussian(),
+      cores  = 4, iter = 2000, seed = 42,
+      file   = sprintf("../results/m_cos_%s", size)
+    )
+  })
+```
+
+```{r cos-brms-coef, fig.height=4}
+cos_brms %>%
+  imap_dfr(function(m, size) {
+    as_draws_df(m) %>%
+      select(starts_with("b_"), -b_Intercept) %>%
+      pivot_longer(everything(), names_to = "term", values_to = "estimate") %>%
+      mutate(model_size = size)
+  }) %>%
+  mutate(
+    model_size = factor(model_size, levels = MODEL_LEVELS),
+    term = recode(term,
+                  b_log_freq_sc              = "log freq",
+                  b_ord_dom_sc               = "ordering dominance",
+                  `b_log_freq_sc:ord_dom_sc` = "freq × dom")
+  ) %>%
+  ggplot(aes(x = estimate, y = term, fill = model_size)) +
+  stat_halfeye(position = position_dodge(width = 0.6), alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  scale_fill_brewer(palette = "Set1", name = "Model") +
+  labs(x = "Posterior estimate", y = NULL,
+       title = "In-context cosine similarity: Bayesian model coefficients") +
+  theme_minimal()
+```
+
+```{r cos-cond-effects, fig.height=4}
+map(cos_sizes, function(size) {
+  ce <- conditional_effects(
+    cos_brms[[size]],
+    effects = "log_freq_sc:ord_dom_sc"
+  )
+  plot(ce, plot = FALSE)[[1]] +
+    labs(title = size,
+         x = "log freq [scaled]", y = "cosine sim [scaled]") +
+    theme_minimal()
+}) %>%
+  wrap_plots(nrow = 1) +
+  plot_annotation(title = "Conditional effects: frequency × ordering dominance (cosine similarity)")
+```
+
+---
+
+## Compositional Similarity (LogCosSim)
+
+`LogCosSim = log(cos_AB / cos_BA)` where `cos_AB` is the cosine similarity
+between the holistic in-context AB-ordering representation and the mean of
+each constituent word embedded independently. Positive LogCosSim = AB ordering
+is more compositionally predictable than BA ordering.
+
+**Predictors:**
+- `log_freq`: log overall corpus frequency
+- `relfreq_c = RelFreq − 0.5`: directional relative frequency (−0.5 = always BA, +0.5 = always AB). Unlike the symmetric metrics above, LogCosSim is directional, so the full signed scale is meaningful.
+
+```{r comp-prep}
+comp <- comp_raw %>%
+  mutate(model_size = factor(model_size, levels = MODEL_LEVELS)) %>%
+  filter_final() %>%
+  pivot_wider(names_from = ordering, values_from = mean_cosine_sim,
+              names_prefix = "comp_sim_") %>%
+  join_freqs() %>%
+  filter(!is.na(overall_freq), overall_freq > 0,
+         !is.na(rel_freq),
+         !is.na(comp_sim_AB), comp_sim_AB > 0,
+         !is.na(comp_sim_BA), comp_sim_BA > 0) %>%
+  mutate(
+    LogCosSim    = log(comp_sim_AB / comp_sim_BA),
+    LogCosSim_sc = sc(LogCosSim),
+    log_freq     = log(overall_freq),
+    log_freq_sc  = sc(log_freq),
+    relfreq_c    = rel_freq - 0.5,
+    log_freq_bin = cut(log_freq, breaks = 3,
+                       labels = c("Low freq", "Mid freq", "High freq")),
+    relfreq_bin  = cut(relfreq_c,
+                       breaks = quantile(relfreq_c, c(0, 1/3, 2/3, 1), na.rm = TRUE),
+                       labels = c("BA-dominant", "Balanced", "AB-dominant"),
+                       include.lowest = TRUE),
+    model_size   = factor(model_size, levels = MODEL_LEVELS)
+  )
+
+comp_sizes <- levels(droplevels(comp$model_size))
+cat("Models:", paste(comp_sizes, collapse = ", "), "\n")
+cat("N per model:\n"); print(count(comp, model_size))
+```
+
+### Visualizations
+
+```{r comp-viz-freq, fig.height=5}
+comp %>%
+  ggplot(aes(x = log_freq, y = LogCosSim, colour = relfreq_c)) +
+  geom_point(alpha = 0.4, size = 0.9) +
+  geom_smooth(method = "lm", colour = "black", linewidth = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  facet_wrap(~model_size, nrow = 1, scales = "free_x") +
+  scale_colour_gradient2(
+    low = "#2166ac", mid = "grey80", high = "#d6604d", midpoint = 0,
+    name = "RelFreq − 0.5\n(−0.5 = BA, +0.5 = AB)"
+  ) +
+  labs(x = "log(overall frequency)", y = "LogCosSim",
+       title = "LogCosSim vs frequency (final checkpoint, last layer)") +
+  theme_minimal() +
+  theme(legend.position = "right")
+```
+
+```{r comp-viz-relfreq, fig.height=5}
+comp %>%
+  ggplot(aes(x = relfreq_c, y = LogCosSim, colour = log_freq_bin)) +
+  geom_point(alpha = 0.4, size = 0.9) +
+  geom_smooth(method = "lm", se = TRUE) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  facet_wrap(~model_size, nrow = 1) +
+  scale_colour_brewer(palette = "Blues", name = "Frequency tertile") +
+  labs(x = "Relative frequency (RelFreq − 0.5)", y = "LogCosSim",
+       title = "LogCosSim vs relative frequency") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+```{r comp-viz-interaction, fig.height=5}
+comp %>%
+  filter(!is.na(relfreq_bin)) %>%
+  ggplot(aes(x = log_freq, y = LogCosSim,
+             colour = relfreq_bin, fill = relfreq_bin)) +
+  geom_point(alpha = 0.2, size = 0.7) +
+  geom_smooth(method = "lm", se = TRUE) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  facet_wrap(~model_size, nrow = 1, scales = "free_x") +
+  scale_colour_brewer(palette = "RdBu", direction = -1,
+                      aesthetics = c("colour", "fill"),
+                      name = "Ordering preference") +
+  labs(x = "log(overall frequency)", y = "LogCosSim",
+       title = "Frequency × relative frequency interaction (LogCosSim)") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+### OLS Coefficients
+
+```{r comp-lm-coef, fig.height=4}
+comp_sizes %>%
+  set_names() %>%
+  map_dfr(function(size) {
+    lm(LogCosSim ~ log_freq_sc * relfreq_c,
+       data = comp %>% filter(model_size == size)) %>%
+      tidy(conf.int = TRUE) %>%
+      filter(term != "(Intercept)")
+  }, .id = "model_size") %>%
+  mutate(
+    model_size = factor(model_size, levels = MODEL_LEVELS),
+    term = recode(term,
+                  log_freq_sc              = "log freq",
+                  relfreq_c                = "relative freq",
+                  `log_freq_sc:relfreq_c`  = "freq × relfreq")
+  ) %>%
+  ggplot(aes(x = estimate, xmin = conf.low, xmax = conf.high,
+             y = term, colour = model_size)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  geom_pointrange(position = position_dodge(width = 0.5), linewidth = 0.8) +
+  scale_colour_brewer(palette = "Set1", name = "Model") +
+  labs(x = "OLS estimate (95% CI)", y = NULL,
+       title = "LogCosSim: OLS coefficients per model") +
+  theme_minimal()
+```
+
+### brms Models
+
+```{r comp-brms-fit, results="hide"}
+comp_brms <- comp_sizes %>%
+  set_names() %>%
+  map(function(size) {
+    brm(
+      LogCosSim_sc ~ log_freq_sc * relfreq_c,
+      data   = comp %>% filter(model_size == size),
+      prior  = base_priors,
+      family = gaussian(),
+      cores  = 4, iter = 2000, seed = 42,
+      file   = sprintf("../results/m_comp2_%s", size)
+    )
+  })
+```
+
+```{r comp-brms-coef, fig.height=4}
+comp_brms %>%
+  imap_dfr(function(m, size) {
+    as_draws_df(m) %>%
+      select(starts_with("b_"), -b_Intercept) %>%
+      pivot_longer(everything(), names_to = "term", values_to = "estimate") %>%
+      mutate(model_size = size)
+  }) %>%
+  mutate(
+    model_size = factor(model_size, levels = MODEL_LEVELS),
+    term = recode(term,
+                  b_log_freq_sc             = "log freq",
+                  b_relfreq_c               = "relative freq",
+                  `b_log_freq_sc:relfreq_c` = "freq × relfreq")
+  ) %>%
+  ggplot(aes(x = estimate, y = term, fill = model_size)) +
+  stat_halfeye(position = position_dodge(width = 0.6), alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  scale_fill_brewer(palette = "Set1", name = "Model") +
+  labs(x = "Posterior estimate", y = NULL,
+       title = "LogCosSim: Bayesian model coefficients") +
+  theme_minimal()
+```
+
+```{r comp-cond-effects, fig.height=4}
+map(comp_sizes, function(size) {
+  ce <- conditional_effects(
+    comp_brms[[size]],
+    effects = "log_freq_sc:relfreq_c"
+  )
+  plot(ce, plot = FALSE)[[1]] +
+    labs(title = size,
+         x = "log freq [scaled]", y = "LogCosSim [scaled]") +
+    theme_minimal()
+}) %>%
+  wrap_plots(nrow = 1) +
+  plot_annotation(title = "Conditional effects: frequency × relative frequency (LogCosSim)")
 ```

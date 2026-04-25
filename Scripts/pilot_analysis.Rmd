@@ -23,10 +23,14 @@ library(broom)
 ```{r load-data}
 MODEL_LEVELS <- c("125m", "350m", "1.3b", "olmo-1b", "olmo-7b")
 
+cos_path       <- "../Data/cosine_similarity.csv"
+comp_path      <- "../Data/compositional_similarity.csv"
+proc_path      <- "../results/binomial_representations.csv"
+infinigram_path <- "../Data/infinigram_freqs.csv"
+
 babylm_freqs    <- read_csv("../Data/babylm_corpus_freqs.csv") %>%
   select(phrase_AB, overall_freq, rel_freq)
 
-infinigram_path <- "../Data/infinigram_freqs.csv"
 infinigram_freqs <- if (file.exists(infinigram_path)) {
   read_csv(infinigram_path) %>% select(phrase_AB, overall_freq, rel_freq)
 } else {
@@ -76,10 +80,6 @@ fit_smart_smooth <- function(data, x_col, y_col,
 ```
 
 ```{r data-check}
-cos_path  <- "../Data/cosine_similarity.csv"
-comp_path <- "../Data/compositional_similarity.csv"
-proc_path <- "../results/binomial_representations.csv"
-
 cat("Files present:\n")
 cat(sprintf("  cosine_similarity.csv:         %s\n", file.exists(cos_path)))
 cat(sprintf("  compositional_similarity.csv:  %s\n", file.exists(comp_path)))
@@ -104,10 +104,12 @@ cos <- read_csv(cos_path) %>%
     log_freq_sc = sc(log_freq),
     ord_dom     = abs(rel_freq - 0.5),
     ord_dom_sc  = sc(ord_dom),
-    ord_dom_bin = cut(ord_dom,
-                      breaks = quantile(ord_dom, c(0, 1/3, 2/3, 1), na.rm = TRUE),
-                      labels = c("Balanced", "Moderate", "Dominant"),
-                      include.lowest = TRUE)
+    ord_dom_bin = factor(
+      case_when(ntile(ord_dom, 3) == 1 ~ "Balanced",
+                ntile(ord_dom, 3) == 2 ~ "Moderate",
+                ntile(ord_dom, 3) == 3 ~ "Dominant"),
+      levels = c("Balanced", "Moderate", "Dominant")
+    )
   )
 
 cos_sizes <- levels(droplevels(cos$model_size))
@@ -211,10 +213,12 @@ comp <- read_csv(comp_path) %>%
     log_freq    = log(overall_freq),
     log_freq_sc = sc(log_freq),
     relfreq_c   = rel_freq - 0.5,
-    relfreq_bin = cut(relfreq_c,
-                      breaks = quantile(relfreq_c, c(0, 1/3, 2/3, 1), na.rm = TRUE),
-                      labels = c("BA-dominant", "Balanced", "AB-dominant"),
-                      include.lowest = TRUE)
+    relfreq_bin = factor(
+      case_when(ntile(relfreq_c, 3) == 1 ~ "BA-dominant",
+                ntile(relfreq_c, 3) == 2 ~ "Balanced",
+                ntile(relfreq_c, 3) == 3 ~ "AB-dominant"),
+      levels = c("BA-dominant", "Balanced", "AB-dominant")
+    )
   )
 
 comp_sizes <- levels(droplevels(comp$model_size))
@@ -320,10 +324,12 @@ proc <- read_csv(proc_path) %>%
     log_freq_sc = sc(log_freq),
     ord_dom     = abs(rel_freq - 0.5),
     ord_dom_sc  = sc(ord_dom),
-    ord_dom_bin = cut(ord_dom,
-                      breaks = quantile(ord_dom, c(0, 1/3, 2/3, 1), na.rm = TRUE),
-                      labels = c("Balanced", "Moderate", "Dominant"),
-                      include.lowest = TRUE)
+    ord_dom_bin = factor(
+      case_when(ntile(ord_dom, 3) == 1 ~ "Balanced",
+                ntile(ord_dom, 3) == 2 ~ "Moderate",
+                ntile(ord_dom, 3) == 3 ~ "Dominant"),
+      levels = c("Balanced", "Moderate", "Dominant")
+    )
   )
 
 proc_sizes <- levels(droplevels(proc$model_size))

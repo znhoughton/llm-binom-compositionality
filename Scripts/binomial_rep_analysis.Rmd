@@ -118,8 +118,8 @@ proc <- proc_raw %>%
     log_freq_sc  = sc(log_freq),
     ord_dom      = abs(rel_freq - 0.5),
     ord_dom_sc   = sc(ord_dom),
-    proc_sc           = sc(procrustes_dist),
-    mean_consistency  = (-self_sim_AB + -self_sim_BA) / 2,
+    proc_sc       = sc(procrustes_dist),
+    self_sim_asym = abs(log(-self_sim_AB / -self_sim_BA)),
     log_freq_bin = cut(log_freq, breaks = 3,
                        labels = c("Low freq", "Mid freq", "High freq")),
     ord_dom_bin  = factor(
@@ -198,12 +198,12 @@ proc %>%
 ```
 
 ```{r proc-viz-partial, fig.height=5}
-# Residualise procrustes_dist on mean_consistency within each model,
+# Residualise procrustes_dist on self_sim_asym within each model,
 # then plot against log_freq × ordering dominance.
 .d <- proc %>%
-  filter(!is.na(ord_dom_bin), !is.na(mean_consistency)) %>%
+  filter(!is.na(ord_dom_bin), is.finite(self_sim_asym)) %>%
   group_by(model_size) %>%
-  mutate(proc_resid = residuals(lm(procrustes_dist ~ mean_consistency))) %>%
+  mutate(proc_resid = residuals(lm(procrustes_dist ~ self_sim_asym))) %>%
   ungroup()
 
 .sm <- fit_smart_smooth(.d, "log_freq", "proc_resid",
@@ -223,8 +223,8 @@ proc %>%
   scale_colour_brewer(palette = "Set2", aesthetics = c("colour", "fill"),
                       name = "Ordering dominance") +
   labs(x = "log(overall frequency)",
-       y = "Procrustes distance (self-similarity residualised)",
-       title = "Frequency × ordering dominance, self-similarity partialled out") +
+       y = "Procrustes distance (self-similarity asymmetry residualised)",
+       title = "Frequency × ordering dominance, self-similarity asymmetry partialled out") +
   theme_minimal() +
   theme(legend.position = "bottom")
 ```
@@ -318,6 +318,61 @@ map(proc_sizes, function(size) {
 }) %>%
   wrap_plots(nrow = 1) +
   plot_annotation(title = "Conditional effects: frequency × ordering dominance (Procrustes)")
+```
+
+### Self-Similarity Asymmetry Follow-Up
+
+`self_sim_asym = |log(consistency_AB / consistency_BA)|` where consistency = −self_sim.
+Near zero = AB and BA representations are equally (un)stable across contexts.
+Large = one ordering is much more context-sensitive than the other, which could
+otherwise confound Procrustes distance. Added as a covariate to check robustness.
+
+```{r proc-brms-ss-fit, results="hide"}
+proc_brms_ss <- proc_sizes %>%
+  set_names() %>%
+  map(function(size) {
+    d <- proc %>%
+      filter(model_size == size, is.finite(self_sim_asym)) %>%
+      mutate(
+        proc_sc          = sc(procrustes_dist),
+        log_freq_sc      = sc(log_freq),
+        ord_dom_sc       = sc(ord_dom),
+        self_sim_asym_sc = sc(self_sim_asym)
+      )
+    brm(
+      proc_sc ~ log_freq_sc * ord_dom_sc + self_sim_asym_sc,
+      data   = d,
+      prior  = base_priors,
+      family = gaussian(),
+      cores  = 4, iter = 2000, seed = 42,
+      file   = sprintf("../results/m_proc_ss_%s", size)
+    )
+  })
+```
+
+```{r proc-brms-ss-coef, fig.height=4}
+proc_brms_ss %>%
+  imap_dfr(function(m, size) {
+    as_draws_df(m) %>%
+      select(starts_with("b_"), -b_Intercept) %>%
+      pivot_longer(everything(), names_to = "term", values_to = "estimate") %>%
+      mutate(model_size = size)
+  }) %>%
+  mutate(
+    model_size = factor(model_size, levels = MODEL_LEVELS),
+    term = recode(term,
+                  b_log_freq_sc              = "log freq",
+                  b_ord_dom_sc               = "ordering dominance",
+                  b_self_sim_asym_sc         = "self-sim asymmetry",
+                  `b_log_freq_sc:ord_dom_sc` = "freq × dom")
+  ) %>%
+  ggplot(aes(x = estimate, y = term, fill = model_size)) +
+  stat_halfeye(position = position_dodge(width = 0.6), alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  scale_fill_brewer(palette = "Set1", name = "Model") +
+  labs(x = "Posterior estimate", y = NULL,
+       title = "Procrustes distance: follow-up model with self-similarity asymmetry") +
+  theme_minimal()
 ```
 
 ---

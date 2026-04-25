@@ -324,12 +324,13 @@ proc <- read_csv(proc_path) %>%
     log_freq_sc = sc(log_freq),
     ord_dom     = abs(rel_freq - 0.5),
     ord_dom_sc  = sc(ord_dom),
-    ord_dom_bin = factor(
+    ord_dom_bin   = factor(
       case_when(ntile(ord_dom, 3) == 1 ~ "Balanced",
                 ntile(ord_dom, 3) == 2 ~ "Moderate",
                 ntile(ord_dom, 3) == 3 ~ "Dominant"),
       levels = c("Balanced", "Moderate", "Dominant")
-    )
+    ),
+    self_sim_asym = abs(log(-self_sim_AB / -self_sim_BA))
   )
 
 proc_sizes <- levels(droplevels(proc$model_size))
@@ -389,12 +390,44 @@ proc %>%
   theme(legend.position = "bottom")
 ```
 
+```{r proc-partial, eval=file.exists(proc_path)}
+.d <- proc %>%
+  filter(!is.na(ord_dom_bin), is.finite(self_sim_asym)) %>%
+  group_by(model_size) %>%
+  mutate(proc_resid = residuals(lm(procrustes_dist ~ self_sim_asym))) %>%
+  ungroup()
+
+.sm <- fit_smart_smooth(.d, "log_freq", "proc_resid",
+                        group_cols = c("model_size", "ord_dom_bin"))
+
+.d %>%
+  ggplot(aes(x = log_freq, y = proc_resid,
+             colour = ord_dom_bin, fill = ord_dom_bin)) +
+  geom_point(alpha = 0.2, size = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_ribbon(data = .sm, aes(x = log_freq, ymin = .lwr, ymax = .upr,
+                               fill = ord_dom_bin),
+              inherit.aes = FALSE, alpha = 0.2) +
+  geom_line(data = .sm, aes(x = log_freq, y = .fit, colour = ord_dom_bin),
+            inherit.aes = FALSE, linewidth = 0.8) +
+  facet_wrap(~model_size, nrow = 1, scales = "free_x") +
+  scale_colour_brewer(palette = "Set2", aesthetics = c("colour", "fill"),
+                      name = "Ordering dominance") +
+  labs(x = "log(overall frequency)",
+       y = "Procrustes distance (self-similarity asymmetry residualised)",
+       title = "Frequency × ordering dominance, self-similarity asymmetry partialled out") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
 ```{r proc-lm, eval=file.exists(proc_path), fig.height=3.5}
 proc_sizes %>%
   set_names() %>%
   map_dfr(function(size) {
-    lm(procrustes_dist ~ log_freq_sc * ord_dom_sc,
-       data = proc %>% filter(model_size == size)) %>%
+    d <- proc %>%
+      filter(model_size == size, is.finite(self_sim_asym)) %>%
+      mutate(self_sim_asym_sc = sc(self_sim_asym))
+    lm(procrustes_dist ~ log_freq_sc * ord_dom_sc + self_sim_asym_sc, data = d) %>%
       tidy(conf.int = TRUE) %>%
       filter(term != "(Intercept)")
   }, .id = "model_size") %>%
@@ -403,6 +436,7 @@ proc_sizes %>%
     term = recode(term,
                   log_freq_sc              = "log freq",
                   ord_dom_sc               = "ordering dominance",
+                  self_sim_asym_sc         = "self-sim asymmetry",
                   `log_freq_sc:ord_dom_sc` = "freq × dom")
   ) %>%
   ggplot(aes(x = estimate, xmin = conf.low, xmax = conf.high,
@@ -411,6 +445,6 @@ proc_sizes %>%
   geom_pointrange(position = position_dodge(width = 0.5), linewidth = 0.8) +
   scale_colour_brewer(palette = "Set1", name = "Model") +
   labs(x = "OLS estimate (95% CI)", y = NULL,
-       title = "Procrustes distance: OLS coefficients") +
+       title = "Procrustes distance: OLS coefficients (with self-similarity asymmetry)") +
   theme_minimal()
 ```

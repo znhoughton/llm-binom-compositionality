@@ -19,14 +19,18 @@ echo -e "\n--- Procrustes + self-similarity (BabyLM; all layers, 10 checkpoints)
 python Scripts/binomial_rep_analysis.py
 
 echo -e "\n--- Cosine similarity (BabyLM + OLMo; all layers, 10 checkpoints) ---"
+# --checkpoints-from pins BabyLM to the exact checkpoints Procrustes used.
+# OLMo models (not in that CSV) fall back to 10 log-sampled checkpoints via resolve_checkpoints.
 python Scripts/get_cosine_similarity.py \
     --layers all \
-    --n-checkpoints 10
+    --n-checkpoints 10 \
+    --checkpoints-from results/binomial_representations.csv
 
 echo -e "\n--- Compositional similarity (BabyLM + OLMo; all layers, 10 checkpoints) ---"
 python Scripts/get_compositional_similarity.py \
     --layers all \
-    --n-checkpoints 10
+    --n-checkpoints 10 \
+    --checkpoints-from results/binomial_representations.csv
 
 echo -e "\n============================================================"
 echo "Full run complete."

@@ -386,29 +386,34 @@ similarity = ordering substantially changes the representation.
 **Predictors:** same as Procrustes — log frequency and ordering dominance.
 
 ```{r cos-prep}
+ss_lookup <- proc_raw %>%
+  select(model, checkpoint, phrase_AB, layer, self_sim_AB, self_sim_BA)
+
 cos <- cos_raw %>%
   mutate(model_size = factor(model_size, levels = MODEL_LEVELS)) %>%
   group_by(model, model_size, checkpoint, step, tokens, phrase_AB, layer) %>%
   summarise(cosine_sim = mean(cosine_sim, na.rm = TRUE), .groups = "drop") %>%
   filter_final() %>%
+  left_join(ss_lookup, by = c("model", "checkpoint", "phrase_AB", "layer")) %>%
   join_freqs() %>%
   filter(!is.na(overall_freq), overall_freq > 0,
          !is.na(rel_freq), !is.na(cosine_sim)) %>%
   mutate(
-    log_freq     = log(overall_freq),
-    log_freq_sc  = sc(log_freq),
-    ord_dom      = abs(rel_freq - 0.5),
-    ord_dom_sc   = sc(ord_dom),
-    cos_sc       = sc(cosine_sim),
-    log_freq_bin = cut(log_freq, breaks = 3,
-                       labels = c("Low freq", "Mid freq", "High freq")),
-    ord_dom_bin  = factor(
+    log_freq      = log(overall_freq),
+    log_freq_sc   = sc(log_freq),
+    ord_dom       = abs(rel_freq - 0.5),
+    ord_dom_sc    = sc(ord_dom),
+    cos_sc        = sc(cosine_sim),
+    self_sim_asym = abs(log(-self_sim_AB / -self_sim_BA)),
+    log_freq_bin  = cut(log_freq, breaks = 3,
+                        labels = c("Low freq", "Mid freq", "High freq")),
+    ord_dom_bin   = factor(
       case_when(ntile(ord_dom, 3) == 1 ~ "Balanced",
                 ntile(ord_dom, 3) == 2 ~ "Moderate",
                 ntile(ord_dom, 3) == 3 ~ "Dominant"),
       levels = c("Balanced", "Moderate", "Dominant")
     ),
-    model_size   = factor(model_size, levels = MODEL_LEVELS)
+    model_size    = factor(model_size, levels = MODEL_LEVELS)
   )
 
 cos_sizes <- levels(droplevels(cos$model_size))
@@ -477,14 +482,46 @@ cos %>%
   theme(legend.position = "bottom")
 ```
 
+```{r cos-viz-partial, fig.height=5}
+.d <- cos %>%
+  filter(!is.na(ord_dom_bin), is.finite(self_sim_asym)) %>%
+  group_by(model_size) %>%
+  mutate(cos_resid = residuals(lm(cosine_sim ~ self_sim_asym))) %>%
+  ungroup()
+
+.sm <- fit_smart_smooth(.d, "log_freq", "cos_resid",
+                        group_cols = c("model_size", "ord_dom_bin"))
+
+.d %>%
+  ggplot(aes(x = log_freq, y = cos_resid,
+             colour = ord_dom_bin, fill = ord_dom_bin)) +
+  geom_point(alpha = 0.2, size = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_ribbon(data = .sm, aes(x = log_freq, ymin = .lwr, ymax = .upr,
+                               fill = ord_dom_bin),
+              inherit.aes = FALSE, alpha = 0.2) +
+  geom_line(data = .sm, aes(x = log_freq, y = .fit, colour = ord_dom_bin),
+            inherit.aes = FALSE, linewidth = 0.8) +
+  facet_wrap(~model_size, nrow = 1, scales = "free_x") +
+  scale_colour_brewer(palette = "Set2", aesthetics = c("colour", "fill"),
+                      name = "Ordering dominance") +
+  labs(x = "log(overall frequency)",
+       y = "Cosine similarity (self-similarity asymmetry residualised)",
+       title = "Frequency × ordering dominance, self-similarity asymmetry partialled out") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
 ### OLS Coefficients
 
 ```{r cos-lm-coef, fig.height=4}
 cos_sizes %>%
   set_names() %>%
   map_dfr(function(size) {
-    lm(cosine_sim ~ log_freq_sc * ord_dom_sc,
-       data = cos %>% filter(model_size == size)) %>%
+    d <- cos %>%
+      filter(model_size == size, is.finite(self_sim_asym)) %>%
+      mutate(self_sim_asym_sc = sc(self_sim_asym))
+    lm(cosine_sim ~ log_freq_sc * ord_dom_sc + self_sim_asym_sc, data = d) %>%
       tidy(conf.int = TRUE) %>%
       filter(term != "(Intercept)")
   }, .id = "model_size") %>%
@@ -493,6 +530,7 @@ cos_sizes %>%
     term = recode(term,
                   log_freq_sc              = "log freq",
                   ord_dom_sc               = "ordering dominance",
+                  self_sim_asym_sc         = "self-sim asymmetry",
                   `log_freq_sc:ord_dom_sc` = "freq × dom")
   ) %>%
   ggplot(aes(x = estimate, xmin = conf.low, xmax = conf.high,
@@ -566,6 +604,60 @@ map(cos_sizes, function(size) {
 }) %>%
   wrap_plots(nrow = 1) +
   plot_annotation(title = "Conditional effects: frequency × ordering dominance (cosine similarity)")
+```
+
+### Self-Similarity Asymmetry Follow-Up
+
+`self_sim_asym = |log(consistency_AB / consistency_BA)|` where consistency = −self_sim.
+Added as a covariate to check whether the frequency × ordering dominance effects
+on cosine similarity are robust to differential context-stability across orderings.
+
+```{r cos-brms-ss-fit, results="hide"}
+cos_brms_ss <- cos_sizes %>%
+  set_names() %>%
+  map(function(size) {
+    d <- cos %>%
+      filter(model_size == size, is.finite(self_sim_asym)) %>%
+      mutate(
+        cos_sc           = sc(cosine_sim),
+        log_freq_sc      = sc(log_freq),
+        ord_dom_sc       = sc(ord_dom),
+        self_sim_asym_sc = sc(self_sim_asym)
+      )
+    brm(
+      cos_sc ~ log_freq_sc * ord_dom_sc + self_sim_asym_sc,
+      data   = d,
+      prior  = base_priors,
+      family = gaussian(),
+      cores  = 4, iter = 2000, seed = 42,
+      file   = sprintf("../results/m_cos_ss_%s", size)
+    )
+  })
+```
+
+```{r cos-brms-ss-coef, fig.height=4}
+cos_brms_ss %>%
+  imap_dfr(function(m, size) {
+    as_draws_df(m) %>%
+      select(starts_with("b_"), -b_Intercept) %>%
+      pivot_longer(everything(), names_to = "term", values_to = "estimate") %>%
+      mutate(model_size = size)
+  }) %>%
+  mutate(
+    model_size = factor(model_size, levels = MODEL_LEVELS),
+    term = recode(term,
+                  b_log_freq_sc              = "log freq",
+                  b_ord_dom_sc               = "ordering dominance",
+                  b_self_sim_asym_sc         = "self-sim asymmetry",
+                  `b_log_freq_sc:ord_dom_sc` = "freq × dom")
+  ) %>%
+  ggplot(aes(x = estimate, y = term, fill = model_size)) +
+  stat_halfeye(position = position_dodge(width = 0.6), alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  scale_fill_brewer(palette = "Set1", name = "Model") +
+  labs(x = "Posterior estimate", y = NULL,
+       title = "Cosine similarity: follow-up model with self-similarity asymmetry") +
+  theme_minimal()
 ```
 
 ---

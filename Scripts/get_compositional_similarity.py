@@ -46,6 +46,7 @@ from binomial_rep_analysis import (
     N_LOG_CHECKPOINTS, PROJECT_ROOT,
     load_binomials, collect_sentences, extract_representations,
     get_model_checkpoints, log_sample_checkpoints, _load_tokenizer,
+    resolve_checkpoints,
 )
 
 # ---------------------------------------------------------------------------
@@ -386,14 +387,14 @@ def main():
             if ckpts_override is not None:
                 checkpoints = ckpts_override[model_name]
             elif ckpts_by_model is not None:
-                checkpoints = ckpts_by_model.get(model_name, [])
-                print(f"  Using {len(checkpoints)} checkpoints from results CSV.")
-            elif "tokens_per_step" in config:
-                checkpoints = get_model_checkpoints(model_name, config["tokens_per_step"])
-                checkpoints = log_sample_checkpoints(checkpoints, args.n_checkpoints)
+                checkpoints = ckpts_by_model.get(model_name)
+                if checkpoints is not None:
+                    print(f"  Using {len(checkpoints)} checkpoints from results CSV.")
+                else:
+                    print(f"  Not in results CSV; discovering checkpoints ...")
+                    checkpoints = resolve_checkpoints(model_name, config, args.n_checkpoints)
             else:
-                checkpoints = [{"checkpoint": "final", "tag": None, "step": 0, "tokens": 0}]
-                print(f"  Final-only model.")
+                checkpoints = resolve_checkpoints(model_name, config, args.n_checkpoints)
 
             for ckpt in checkpoints:
                 process_checkpoint(

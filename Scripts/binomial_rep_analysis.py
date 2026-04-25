@@ -115,6 +115,7 @@ EXTRA_MODEL_CONFIGS = {
         "trust_remote_code": True,
         "torch_dtype":       "float16",
         "job_weight":        7.0,
+        "checkpoint_style":  "olmo-stage1",  # branches: stage1-stepN-tokensXB
     },
     "allenai/OLMo-2-1124-7B": {
         "size_label":        "olmo-7b",
@@ -124,6 +125,7 @@ EXTRA_MODEL_CONFIGS = {
         "trust_remote_code": True,
         "torch_dtype":       "float16",
         "job_weight":        50.0,
+        "checkpoint_style":  "olmo",         # branches: stepN-tokensXB
     },
 }
 
@@ -205,6 +207,66 @@ def log_sample_checkpoints(checkpoints: List[Dict], n: int = 20) -> List[Dict]:
     sampled = [checkpoints[i] for i in indices]
     print(f"  Log-sampled {len(sampled)}/{total} checkpoints")
     return sampled
+
+
+def get_olmo_checkpoints(repo_id: str, stage1_only: bool = False) -> List[Dict]:
+    """
+    Discover intermediate checkpoints for OLMo-2 models from HuggingFace branches.
+      OLMo-2-0425-1B  →  stage1_only=True  →  branches: stage1-stepN-tokensXB
+      OLMo-2-1124-7B  →  stage1_only=False →  branches: stepN-tokensXB
+    Token counts are parsed directly from the branch name (no tokens_per_step needed).
+    """
+    import re
+    api  = HfApi()
+    refs = api.list_repo_refs(repo_id)
+
+    if stage1_only:
+        pattern = re.compile(r"^stage1-step(\d+)-tokens(\d+)B$")
+    else:
+        pattern = re.compile(r"^step(\d+)-tokens(\d+)B$")
+
+    checkpoints = []
+    for branch in refs.branches:
+        m = pattern.match(branch.name)
+        if not m:
+            continue
+        step     = int(m.group(1))
+        tokens_b = int(m.group(2))
+        checkpoints.append({
+            "checkpoint": branch.name,
+            "tag":        branch.name,
+            "step":       step,
+            "tokens":     tokens_b * 1_000_000_000,
+        })
+
+    checkpoints.sort(key=lambda x: x["step"])
+    if checkpoints:
+        print(f"  Found {len(checkpoints)} checkpoints "
+              f"(steps {checkpoints[0]['step']} → {checkpoints[-1]['step']})")
+    else:
+        print(f"  ⚠️  No matching checkpoints found for {repo_id}")
+    return checkpoints
+
+
+def resolve_checkpoints(model_name: str, config: dict, n: int) -> List[Dict]:
+    """
+    Return log-sampled checkpoints for a model config.
+    Dispatches to the right discovery function based on config keys:
+      - 'tokens_per_step'  → BabyLM-style step-* tags
+      - 'checkpoint_style' = 'olmo-stage1' or 'olmo' → OLMo-2 branches
+      - neither            → final checkpoint only
+    """
+    if "tokens_per_step" in config:
+        ckpts = get_model_checkpoints(model_name, config["tokens_per_step"])
+    elif config.get("checkpoint_style") == "olmo-stage1":
+        ckpts = get_olmo_checkpoints(model_name, stage1_only=True)
+    elif config.get("checkpoint_style") == "olmo":
+        ckpts = get_olmo_checkpoints(model_name, stage1_only=False)
+    else:
+        print(f"  Final-only model.")
+        return [{"checkpoint": "final", "tag": None, "step": 0, "tokens": 0}]
+    return log_sample_checkpoints(ckpts, n)
+
 
 # ---------------------------------------------------------------------------
 # DATA LOADING

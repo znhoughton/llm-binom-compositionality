@@ -99,7 +99,7 @@ def process_checkpoint(
     model_name, config, ckpt, tokenizer,
     binoms_df, phrase_sentence_map,
     completed, writer, out_file,
-    device, layers_filter,
+    device, layers_filter, chunk_size=None,
 ):
     size_label = config["size_label"]
     print(f"\n  Checkpoint: {ckpt['checkpoint']}  "
@@ -117,66 +117,78 @@ def process_checkpoint(
             load_kw["trust_remote_code"] = True
         model = AutoModel.from_pretrained(model_name, **load_kw).to(device).eval()
 
-        all_map = {
-            phrase: phrase_sentence_map[phrase]
-            for _, row in binoms_df.iterrows()
-            for phrase in (row["phrase_AB"], row["phrase_BA"])
-        }
+        import math
+        n_chunks = math.ceil(len(binoms_df) / chunk_size) if chunk_size else 1
+        chunks = [
+            binoms_df.iloc[i * chunk_size:(i + 1) * chunk_size]
+            if chunk_size else binoms_df
+            for i in range(n_chunks)
+        ]
 
-        print(f"  Extracting representations for all binomials ...")
-        all_reps = extract_representations(
-            model, tokenizer, all_map, device,
-            batch_size=config.get("batch_size", DEFAULT_BATCH_SIZE),
-        )
+        for chunk_idx, chunk_df in enumerate(chunks):
+            if n_chunks > 1:
+                print(f"  Chunk {chunk_idx + 1}/{n_chunks} ...")
 
-        all_layers = sorted({
-            layer
-            for _, row in binoms_df.iterrows()
-            for layer in (
-                set(all_reps.get(row["phrase_AB"], {})) &
-                set(all_reps.get(row["phrase_BA"], {}))
+            chunk_map = {
+                phrase: phrase_sentence_map[phrase]
+                for _, row in chunk_df.iterrows()
+                for phrase in (row["phrase_AB"], row["phrase_BA"])
+            }
+
+            all_reps = extract_representations(
+                model, tokenizer, chunk_map, device,
+                batch_size=config.get("batch_size", DEFAULT_BATCH_SIZE),
             )
-        })
-        if layers_filter == "last":
-            all_layers = [max(all_layers)] if all_layers else []
-        elif layers_filter is not None:
-            keep = {int(x) for x in layers_filter.split(",")}
-            all_layers = [l for l in all_layers if l in keep]
 
-        for layer_idx in tqdm(all_layers, desc="  Layers"):
-            for _, row in binoms_df.iterrows():
-                ab = row["phrase_AB"]
-                ba = row["phrase_BA"]
+            all_layers = sorted({
+                layer
+                for _, row in chunk_df.iterrows()
+                for layer in (
+                    set(all_reps.get(row["phrase_AB"], {})) &
+                    set(all_reps.get(row["phrase_BA"], {}))
+                )
+            })
+            if layers_filter == "last":
+                all_layers = [max(all_layers)] if all_layers else []
+            elif layers_filter is not None:
+                keep = {int(x) for x in layers_filter.split(",")}
+                all_layers = [l for l in all_layers if l in keep]
 
-                if (model_name, ckpt["checkpoint"], ab, layer_idx) in completed:
-                    continue
-                if layer_idx not in all_reps.get(ab, {}):
-                    continue
-                if layer_idx not in all_reps.get(ba, {}):
-                    continue
+            for layer_idx in tqdm(all_layers, desc="  Layers"):
+                for _, row in chunk_df.iterrows():
+                    ab = row["phrase_AB"]
+                    ba = row["phrase_BA"]
 
-                A = all_reps[ab][layer_idx]
-                B = all_reps[ba][layer_idx]
-                n = min(len(A), len(B))
-                if n == 0:
-                    continue
+                    if (model_name, ckpt["checkpoint"], ab, layer_idx) in completed:
+                        continue
+                    if layer_idx not in all_reps.get(ab, {}):
+                        continue
+                    if layer_idx not in all_reps.get(ba, {}):
+                        continue
 
-                sims = paired_cosine_sim(A[:n], B[:n])
+                    A = all_reps[ab][layer_idx]
+                    B = all_reps[ba][layer_idx]
+                    n = min(len(A), len(B))
+                    if n == 0:
+                        continue
 
-                completed.add((model_name, ckpt["checkpoint"], ab, layer_idx))
-                for sim in sims:
-                    writer.writerow({
-                        "model":      model_name,
-                        "model_size": size_label,
-                        "checkpoint": ckpt["checkpoint"],
-                        "step":       ckpt["step"],
-                        "tokens":     ckpt["tokens"],
-                        "phrase_AB":  ab,
-                        "layer":      layer_idx,
-                        "cosine_sim": float(sim),
-                    })
+                    sims = paired_cosine_sim(A[:n], B[:n])
 
-            out_file.flush()
+                    completed.add((model_name, ckpt["checkpoint"], ab, layer_idx))
+                    for sim in sims:
+                        writer.writerow({
+                            "model":      model_name,
+                            "model_size": size_label,
+                            "checkpoint": ckpt["checkpoint"],
+                            "step":       ckpt["step"],
+                            "tokens":     ckpt["tokens"],
+                            "phrase_AB":  ab,
+                            "layer":      layer_idx,
+                            "cosine_sim": float(sim),
+                        })
+
+                out_file.flush()
+            del all_reps
 
         print(f"  Done.")
 
@@ -239,6 +251,10 @@ def main():
         "--trust-remote-code", action="store_true",
         help="Pass trust_remote_code=True to from_pretrained (needed for some models e.g. OLMo).",
     )
+    parser.add_argument(
+        "--chunk-size", type=int, default=None,
+        help="Process binomials in chunks of this size (useful for large models to limit RAM).",
+    )
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -297,6 +313,7 @@ def main():
                     binoms_df, phrase_sentence_map,
                     completed, writer, out_file,
                     device, layers_filter,
+                    chunk_size=args.chunk_size,
                 )
     finally:
         out_file.close()

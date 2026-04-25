@@ -218,6 +218,18 @@ def main():
         "--checkpoints-from", type=str, default=None, metavar="CSV",
         help="Read checkpoints from an existing results CSV.",
     )
+    parser.add_argument(
+        "--model", type=str, default=None,
+        help="Run on a single HuggingFace model (bypasses MODEL_CONFIGS, uses final weights only).",
+    )
+    parser.add_argument(
+        "--size-label", type=str, default=None,
+        help="Size label for --model (e.g. '7b'). Defaults to the model name.",
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
+        help=f"Batch size for --model (default {DEFAULT_BATCH_SIZE}).",
+    )
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -240,12 +252,29 @@ def main():
     else:
         ckpts_by_model = None
 
+    if args.model:
+        models_to_run = {
+            args.model: {
+                "size_label": args.size_label or args.model,
+                "batch_size": args.batch_size,
+                "tokenizer":  args.model,
+            }
+        }
+        ckpts_override = {
+            args.model: [{"checkpoint": "final", "tag": None, "step": 0, "tokens": 0}]
+        }
+    else:
+        models_to_run  = MODEL_CONFIGS
+        ckpts_override = None
+
     try:
-        for model_name, config in MODEL_CONFIGS.items():
+        for model_name, config in models_to_run.items():
             print(f"\n{'='*60}\nModel: {model_name}\n{'='*60}")
             tokenizer = _load_tokenizer(config)
 
-            if ckpts_by_model is not None:
+            if ckpts_override is not None:
+                checkpoints = ckpts_override[model_name]
+            elif ckpts_by_model is not None:
                 checkpoints = ckpts_by_model.get(model_name, [])
                 print(f"  Using {len(checkpoints)} checkpoints from results CSV.")
             else:

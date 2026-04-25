@@ -97,8 +97,31 @@ MODEL_CONFIGS = {
         "tokens_per_step": 409_600,
         "tokenizer":       "znhoughton/opt-babylm-1.3b-20eps-seed964",
         "size_label":      "1.3b",
-        "batch_size":      2048,  # start high; OOM fallback will halve if needed
+        "batch_size":      512,   # reduced from 2048; OOM fallback will halve further if needed
         "job_weight":      26.0,
+    },
+}
+
+# External (non-BabyLM) models — used by get_cosine_similarity.py and
+# get_compositional_similarity.py for final-checkpoint-only runs.
+# These do not have tokens_per_step or job_weight (no checkpoint traversal).
+EXTRA_MODEL_CONFIGS = {
+    "allenai/OLMo-2-0425-1B": {
+        "size_label":        "olmo-1b",
+        "tokenizer":         "allenai/OLMo-2-0425-1B",
+        "batch_size":        256,
+        "chunk_size":        100,
+        "trust_remote_code": True,
+        "torch_dtype":       "float16",
+    },
+    "allenai/OLMo-2-0325-32B": {
+        "size_label":        "olmo-32b",
+        "tokenizer":         "allenai/OLMo-2-0325-32B",
+        "batch_size":        8,
+        "chunk_size":        25,
+        "trust_remote_code": True,
+        "torch_dtype":       "float16",
+        "device_map":        "auto",
     },
 }
 

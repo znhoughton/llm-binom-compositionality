@@ -62,7 +62,7 @@ df <- df_raw %>%
     consistency      = -self_sim_AB,
     consistency_BA   = -self_sim_BA,
     mean_consistency = (consistency + consistency_BA) / 2,
-    model_size  = factor(model_size, levels = c("125m", "350m", "1.3b"))
+    model_size  = factor(model_size, levels = c("125m", "350m", "1.3b", "olmo-1b", "olmo-32b"))
   )
 
 # Label early / mid / final checkpoints per model
@@ -276,7 +276,7 @@ df_all_layers_final <- df_raw %>%
   semi_join(final_steps, by = c("model_size", "step")) %>%
   mutate(
     log_freq   = log1p(corpus_freq),
-    model_size = factor(model_size, levels = c("125m", "350m", "1.3b")),
+    model_size = factor(model_size, levels = c("125m", "350m", "1.3b", "olmo-1b", "olmo-32b")),
     layer_prop = layer / max(layer),   # normalise within each row (max varies by model)
   )
 
@@ -345,7 +345,7 @@ df_raw %>%
   inner_join(checkpoint_labels %>% select(model_size, step, ckpt_label),
              by = c("model_size", "step")) %>%
   mutate(
-    model_size = factor(model_size, levels = c("125m", "350m", "1.3b")),
+    model_size = factor(model_size, levels = c("125m", "350m", "1.3b", "olmo-1b", "olmo-32b")),
     ckpt_label = factor(ckpt_label, levels = c("early", "mid", "final"))
   ) %>%
   group_by(model_size, ckpt_label, layer) %>%
@@ -606,4 +606,154 @@ plots <- map(model_sizes, function(size) {
 
 wrap_plots(plots, nrow = 1) +
   plot_annotation(title = "Consistency × frequency interaction at final checkpoint")
+```
+
+## Compositional Similarity
+
+How similar is the model's holistic representation of each binomial (in sentence
+context) to the mean of its constituent words embedded individually?
+`LogCosSim = log(cos_α / cos_¬α)` where `cos_α` is the cosine similarity between
+the in-context AB-ordering representation and the compositional (word-average)
+representation, and `cos_¬α` is the same for the BA ordering.
+Positive LogCosSim = the AB ordering is more compositionally predictable.
+
+```{r comp-sim-load}
+comp_sim_raw <- read_csv("../Data/compositional_similarity.csv")
+
+binoms_freq <- read_csv("../Data/nonce_and_attested_binoms.csv") %>%
+  filter(Attested == 1) %>%
+  mutate(phrase_AB = paste(tolower(Word1), "and", tolower(Word2))) %>%
+  select(phrase_AB, OverallFreq, RelFreq)
+
+comp_wide <- comp_sim_raw %>%
+  group_by(model) %>%
+  filter(layer == max(layer), tokens == max(tokens)) %>%
+  ungroup() %>%
+  pivot_wider(names_from = ordering, values_from = mean_cosine_sim,
+              names_prefix = "comp_sim_") %>%
+  left_join(binoms_freq, by = "phrase_AB") %>%
+  filter(!is.na(OverallFreq), OverallFreq > 0,
+         comp_sim_AB > 0, comp_sim_BA > 0) %>%
+  mutate(
+    LogCosSim       = log(comp_sim_AB / comp_sim_BA),
+    LogCosSim_sc    = as.vector(scale(LogCosSim)),
+    log_freq_c      = as.vector(scale(log(OverallFreq))),
+    RelFreq_recoded = RelFreq - 0.5,
+    relfreq_bin     = cut(RelFreq_recoded,
+                          breaks = quantile(RelFreq_recoded, c(0, 1/3, 2/3, 1), na.rm = TRUE),
+                          labels = c("BA-dominant", "Balanced", "AB-dominant"),
+                          include.lowest = TRUE),
+    model_size      = factor(model_size,
+                             levels = c("125m", "350m", "1.3b", "olmo-1b", "olmo-32b"))
+  )
+
+comp_model_sizes <- levels(droplevels(comp_wide$model_size))
+cat("Models in compositional similarity data:", paste(comp_model_sizes, collapse = ", "), "\n")
+```
+
+### Visualisations
+
+```{r comp-sim-viz, fig.height=8}
+p_freq <- comp_wide %>%
+  ggplot(aes(x = log_freq_c, y = LogCosSim, colour = relfreq_bin)) +
+  geom_point(alpha = 0.3, size = 0.8) +
+  geom_smooth(method = "lm", se = TRUE) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  facet_wrap(~model_size, nrow = 1) +
+  scale_colour_brewer(palette = "RdBu", direction = -1) +
+  labs(
+    x      = "log(Overall frequency) [centered]",
+    y      = "LogCosSim",
+    colour = "Relative frequency",
+    title  = "LogCosSim by overall frequency (last layer, final checkpoint)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+p_relfreq <- comp_wide %>%
+  ggplot(aes(x = RelFreq_recoded, y = LogCosSim, colour = relfreq_bin)) +
+  geom_point(alpha = 0.3, size = 0.8) +
+  geom_smooth(method = "lm", se = TRUE) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  facet_wrap(~model_size, nrow = 1) +
+  scale_colour_brewer(palette = "RdBu", direction = -1, guide = "none") +
+  labs(
+    x     = "Relative frequency (−0.5 = always BA, +0.5 = always AB)",
+    y     = "LogCosSim",
+    title = "LogCosSim by relative frequency"
+  ) +
+  theme_minimal()
+
+p_freq / p_relfreq
+```
+
+### brms Models: LogCosSim ~ OverallFreq × RelFreq
+
+One model per LLM. Outcome: `LogCosSim` scaled to mean 0, SD 1.
+Predictors: `log(OverallFreq)` centered and scaled, `RelFreq` recoded to −0.5–0.5.
+
+```{r comp-sim-brms-fit, results="hide"}
+comp_priors <- c(
+  prior(normal(0, 1), class = b),
+  prior(normal(0, 1), class = Intercept),
+  prior(exponential(1), class = sigma)
+)
+
+comp_models <- map(comp_model_sizes, function(size) {
+  d <- comp_wide %>% filter(model_size == size)
+  brm(
+    LogCosSim_sc ~ log_freq_c * RelFreq_recoded,
+    data   = d,
+    prior  = comp_priors,
+    family = gaussian(),
+    cores  = 4,
+    iter   = 2000,
+    seed   = 42,
+    file   = sprintf("../results/m_comp_%s", size)
+  )
+}) %>% set_names(comp_model_sizes)
+```
+
+```{r comp-sim-brms-summaries}
+iwalk(comp_models, function(m, size) {
+  cat(sprintf("\n=== %s ===\n", size))
+  print(summary(m))
+})
+```
+
+```{r comp-sim-coef-plot, fig.height=5}
+imap_dfr(comp_models, function(m, size) {
+  as_draws_df(m) %>%
+    select(starts_with("b_"), -b_Intercept) %>%
+    pivot_longer(everything(), names_to = "term", values_to = "estimate") %>%
+    mutate(model_size = size)
+}) %>%
+  mutate(model_size = factor(model_size, levels = comp_model_sizes)) %>%
+  ggplot(aes(x = estimate, y = term)) +
+  stat_halfeye(fill = "#4393c3", alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  facet_wrap(~model_size, nrow = 1) +
+  labs(
+    x     = "Posterior estimate",
+    y     = NULL,
+    title = "LogCosSim model coefficients per LLM (OverallFreq × RelFreq)"
+  ) +
+  theme_minimal()
+```
+
+```{r comp-sim-cond-effects, fig.height=4}
+ce_plots <- map(comp_model_sizes, function(size) {
+  ce <- conditional_effects(
+    comp_models[[size]],
+    effects = "log_freq_c:RelFreq_recoded"
+  )
+  plot(ce, plot = FALSE)[[1]] +
+    labs(title = size,
+         x     = "log(freq) [centered]",
+         y     = "LogCosSim [scaled]") +
+    theme_minimal()
+})
+
+wrap_plots(ce_plots, nrow = 1) +
+  plot_annotation(title = "Interaction: overall frequency × relative frequency on LogCosSim")
 ```

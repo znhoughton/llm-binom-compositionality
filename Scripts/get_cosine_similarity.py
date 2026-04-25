@@ -37,7 +37,7 @@ from transformers import AutoModel
 
 sys.path.insert(0, str(Path(__file__).parent))
 from binomial_rep_analysis import (
-    BINOMS_CSV, MODEL_CONFIGS, DEFAULT_BATCH_SIZE,
+    BINOMS_CSV, MODEL_CONFIGS, EXTRA_MODEL_CONFIGS, DEFAULT_BATCH_SIZE,
     N_LOG_CHECKPOINTS, PROJECT_ROOT,
     load_binomials, collect_sentences, extract_representations,
     get_model_checkpoints, log_sample_checkpoints, _load_tokenizer,
@@ -115,7 +115,14 @@ def process_checkpoint(
             load_kw["cache_dir"] = tmp_cache
         if config.get("trust_remote_code"):
             load_kw["trust_remote_code"] = True
-        model = AutoModel.from_pretrained(model_name, **load_kw).to(device).eval()
+        if config.get("torch_dtype") == "float16":
+            load_kw["torch_dtype"] = torch.float16
+        if config.get("device_map"):
+            load_kw["device_map"] = config["device_map"]
+        model = AutoModel.from_pretrained(model_name, **load_kw)
+        if not config.get("device_map"):
+            model = model.to(device)
+        model = model.eval()
 
         import math
         n_chunks = math.ceil(len(binoms_df) / chunk_size) if chunk_size else 1
@@ -290,7 +297,7 @@ def main():
             args.model: [{"checkpoint": "final", "tag": None, "step": 0, "tokens": 0}]
         }
     else:
-        models_to_run  = MODEL_CONFIGS
+        models_to_run  = {**MODEL_CONFIGS, **EXTRA_MODEL_CONFIGS}
         ckpts_override = None
 
     try:
@@ -303,9 +310,12 @@ def main():
             elif ckpts_by_model is not None:
                 checkpoints = ckpts_by_model.get(model_name, [])
                 print(f"  Using {len(checkpoints)} checkpoints from results CSV.")
-            else:
+            elif "tokens_per_step" in config:
                 checkpoints = get_model_checkpoints(model_name, config["tokens_per_step"])
                 checkpoints = log_sample_checkpoints(checkpoints, args.n_checkpoints)
+            else:
+                checkpoints = [{"checkpoint": "final", "tag": None, "step": 0, "tokens": 0}]
+                print(f"  Final-only model.")
 
             for ckpt in checkpoints:
                 process_checkpoint(
@@ -313,7 +323,7 @@ def main():
                     binoms_df, phrase_sentence_map,
                     completed, writer, out_file,
                     device, layers_filter,
-                    chunk_size=args.chunk_size,
+                    chunk_size=args.chunk_size or config.get("chunk_size"),
                 )
     finally:
         out_file.close()

@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
 """
-get_linear_decodability.py
---------------------------
-Re-extracts phrase representations from OPT BabyLM checkpoints and computes
-linear decodability for each attested binomial: how accurately a logistic
-regression classifier (10-fold stratified CV) can decode the ordering (AB vs
-BA) from the layer representations.
+get_cosine_similarity.py
+------------------------
+Extracts phrase representations from OPT BabyLM checkpoints and computes
+the mean pairwise cosine similarity between matched AB and BA sentence pairs
+for each attested binomial.
 
-Joinable to binomial_representations.csv on (model, checkpoint, phrase_AB, layer).
+For each binomial, sentence i in the AB pool and sentence i in the BA pool
+are the same sentence with the phrase order swapped — so cosine similarity
+directly measures how much swapping the phrase order changes the model's
+representation.
 
-Output: Data/linear_decodability.csv
+  High cosine_sim → model represents the two orderings similarly
+  Low cosine_sim  → model represents them very differently
+
+Output: Data/cosine_similarity.csv
 
 Usage:
-    python Scripts/get_linear_decodability.py --layers last --n-checkpoints 1
-    python Scripts/get_linear_decodability.py \\
-        --checkpoints-from results/binomial_representations.csv --layers last
+    python Scripts/get_cosine_similarity.py --layers last --n-checkpoints 1
+    python Scripts/get_cosine_similarity.py \\
+        --checkpoints-from Data/binomial_representations.csv --layers last
 """
 
 import argparse
@@ -26,17 +31,10 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
-from joblib import Parallel, delayed
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import StratifiedKFold, cross_val_predict
 from tqdm import tqdm
 import torch
 from transformers import AutoModel
 
-# ---------------------------------------------------------------------------
-# Reuse utilities from the main analysis script
-# ---------------------------------------------------------------------------
 sys.path.insert(0, str(Path(__file__).parent))
 from binomial_rep_analysis import (
     BINOMS_CSV, MODEL_CONFIGS, DEFAULT_BATCH_SIZE,
@@ -48,22 +46,18 @@ from binomial_rep_analysis import (
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
-OUT_CSV = str(Path(PROJECT_ROOT) / "Data" / "linear_decodability.csv")
+OUT_CSV = str(Path(PROJECT_ROOT) / "Data" / "cosine_similarity.csv")
 
 FIELDNAMES = [
     "model", "model_size", "checkpoint", "step", "tokens",
-    "phrase_AB", "layer", "label", "logit",
+    "phrase_AB", "layer", "cosine_sim",
 ]
-
-N_FOLDS = 10    # stratified k-fold splits
-N_JOBS  = 12    # joblib workers for parallel logistic regression
 
 
 # ---------------------------------------------------------------------------
 # RESUME LOGIC
 # ---------------------------------------------------------------------------
 def load_completed(path: str) -> set:
-    """Returns set of (model, checkpoint, phrase_AB, layer) already written."""
     completed: set = set()
     if not Path(path).exists():
         return completed
@@ -85,28 +79,17 @@ def open_output(path: str):
 
 
 # ---------------------------------------------------------------------------
-# DECODABILITY
+# COSINE SIMILARITY
 # ---------------------------------------------------------------------------
-def _logreg_cv_one(A_arr: np.ndarray, B_arr: np.ndarray, n: int):
+def paired_cosine_sim(A: np.ndarray, B: np.ndarray) -> np.ndarray:
     """
-    StandardScaler + 10-fold stratified CV logistic regression for one binomial.
-    Called in parallel across binomials via joblib.
-
-    A_arr: (>=n, D) — AB-order representations
-    B_arr: (>=n, D) — BA-order representations
-
-    Returns (logits, y) or (None, None) if too few samples.
+    Per-pair cosine similarity between matched rows of A and B.
+    A, B: (n, D)
+    Returns: (n,) cosine similarities
     """
-    if n < N_FOLDS * 2:
-        return None, None
-
-    X      = StandardScaler().fit_transform(np.vstack([A_arr[:n], B_arr[:n]]))
-    y      = np.array([0] * n + [1] * n, dtype=np.int32)
-    clf    = LogisticRegression(C=1.0, max_iter=1000, solver="lbfgs")
-    cv     = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
-    logits = cross_val_predict(clf, X, y, cv=cv,
-                               method="decision_function", n_jobs=1)
-    return logits, y
+    A_norm = A / np.linalg.norm(A, axis=1, keepdims=True)
+    B_norm = B / np.linalg.norm(B, axis=1, keepdims=True)
+    return (A_norm * B_norm).sum(axis=1)
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +105,7 @@ def process_checkpoint(
     print(f"\n  Checkpoint: {ckpt['checkpoint']}  "
           f"(step={ckpt['step']}, tokens={ckpt['tokens']:,})")
 
-    tmp_cache = tempfile.mkdtemp(prefix="hf_dec_")
+    tmp_cache = tempfile.mkdtemp(prefix="hf_cos_")
     model = None
     try:
         load_kw = dict(low_cpu_mem_usage=True, cache_dir=tmp_cache)
@@ -156,45 +139,28 @@ def process_checkpoint(
             keep = {int(x) for x in layers_filter.split(",")}
             all_layers = [l for l in all_layers if l in keep]
 
-        for layer_idx in tqdm(all_layers, desc="  Layers", position=0):
-            pending = [
-                (row["phrase_AB"],
-                 all_reps[row["phrase_AB"]][layer_idx],
-                 all_reps[row["phrase_BA"]][layer_idx])
-                for _, row in binoms_df.iterrows()
-                if (model_name, ckpt["checkpoint"], row["phrase_AB"], layer_idx)
-                   not in completed
-                and layer_idx in all_reps.get(row["phrase_AB"], {})
-                and layer_idx in all_reps.get(row["phrase_BA"], {})
-            ]
-            if not pending:
-                continue
+        for layer_idx in tqdm(all_layers, desc="  Layers"):
+            for _, row in binoms_df.iterrows():
+                ab = row["phrase_AB"]
+                ba = row["phrase_BA"]
 
-            abs_list = [p[0] for p in pending]
-            A_arrs   = [p[1] for p in pending]
-            B_arrs   = [p[2] for p in pending]
-            n = min(
-                min(len(a) for a in A_arrs),
-                min(len(b) for b in B_arrs),
-            )
-            if n < N_FOLDS * 2:
-                continue
-
-            tqdm.write(f"    layer {layer_idx:>2d}: "
-                       f"{len(pending)} binomials, n={n} sentences")
-
-            results = Parallel(n_jobs=N_JOBS)(
-                delayed(_logreg_cv_one)(A_arrs[i], B_arrs[i], n)
-                for i in tqdm(range(len(pending)),
-                              desc=f"      binomials (layer {layer_idx})",
-                              position=1, leave=False)
-            )
-
-            for ab, (logits, labels) in zip(abs_list, results):
-                if logits is None:
+                if (model_name, ckpt["checkpoint"], ab, layer_idx) in completed:
                     continue
+                if layer_idx not in all_reps.get(ab, {}):
+                    continue
+                if layer_idx not in all_reps.get(ba, {}):
+                    continue
+
+                A = all_reps[ab][layer_idx]
+                B = all_reps[ba][layer_idx]
+                n = min(len(A), len(B))
+                if n == 0:
+                    continue
+
+                sims = paired_cosine_sim(A[:n], B[:n])
+
                 completed.add((model_name, ckpt["checkpoint"], ab, layer_idx))
-                for logit, label in zip(logits, labels):
+                for sim in sims:
                     writer.writerow({
                         "model":      model_name,
                         "model_size": size_label,
@@ -203,8 +169,7 @@ def process_checkpoint(
                         "tokens":     ckpt["tokens"],
                         "phrase_AB":  ab,
                         "layer":      layer_idx,
-                        "label":      int(label),
-                        "logit":      float(logit),
+                        "cosine_sim": float(sim),
                     })
 
             out_file.flush()
@@ -222,13 +187,6 @@ def process_checkpoint(
 # MAIN
 # ---------------------------------------------------------------------------
 def _checkpoints_from_csv(csv_path: str) -> dict:
-    """
-    Read unique (model, checkpoint, step, tokens) combinations from an existing
-    results CSV (e.g. binomial_representations.csv) and return them as a dict:
-        { model_name: [{"checkpoint": ..., "tag": ..., "step": ..., "tokens": ...}, ...] }
-    This guarantees the decodability run uses exactly the same checkpoints as
-    the Procrustes run, regardless of any new checkpoints added to HuggingFace.
-    """
     import pandas as pd
     df = pd.read_csv(csv_path, usecols=["model", "checkpoint", "step", "tokens"])
     result = {}
@@ -245,11 +203,11 @@ def _checkpoints_from_csv(csv_path: str) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compute linear decodability of binomial ordering from LLM representations."
+        description="Compute paired cosine similarity of AB vs BA representations."
     )
     parser.add_argument(
         "--n-checkpoints", type=int, default=N_LOG_CHECKPOINTS,
-        help="Number of log-sampled checkpoints (1 = final only, default=%(default)s). "
+        help="Number of log-sampled checkpoints (1 = final only). "
              "Ignored when --checkpoints-from is set.",
     )
     parser.add_argument(
@@ -257,11 +215,8 @@ def main():
         help="Layers to score: 'all', 'last' (default), or comma-separated indices.",
     )
     parser.add_argument(
-        "--checkpoints-from", type=str, default=None,
-        metavar="CSV",
-        help="Read checkpoints from an existing results CSV instead of re-sampling "
-             "(e.g. results/binomial_representations.csv). Guarantees the same "
-             "checkpoint set as the Procrustes run.",
+        "--checkpoints-from", type=str, default=None, metavar="CSV",
+        help="Read checkpoints from an existing results CSV.",
     )
     args = parser.parse_args()
 
@@ -312,10 +267,9 @@ def main():
         import pandas as pd
         df = pd.read_csv(OUT_CSV)
         n_binoms = df.groupby(["model", "checkpoint", "phrase_AB", "layer"]).ngroups
-        log_loss = np.log1p(np.exp(np.where(df["label"] == 1, -df["logit"], df["logit"])))
         print(f"  {len(df):,} rows  |  {n_binoms:,} binomial×checkpoint×layer combinations")
-        print(f"  Mean log-loss: {log_loss.mean():.3f}  (chance = {np.log(2):.3f}"
-              f", range: {log_loss.min():.3f} – {log_loss.max():.3f})")
+        print(f"  Mean cosine similarity: {df['cosine_sim'].mean():.4f}  "
+              f"(range: {df['cosine_sim'].min():.4f} – {df['cosine_sim'].max():.4f})")
 
 
 if __name__ == "__main__":

@@ -69,6 +69,29 @@ base_priors <- c(
   prior(normal(0, 1),   class = Intercept),
   prior(exponential(1), class = sigma)
 )
+
+# Fit linear vs quadratic per group; select by AIC (delta > 2 → quadratic).
+# Returns a prediction df: <x_col>, .fit, .lwr, .upr, + group columns.
+fit_smart_smooth <- function(data, x_col, y_col,
+                              group_cols = "model_size",
+                              delta_aic  = 2) {
+  data %>%
+    filter(!is.na(.data[[x_col]]), !is.na(.data[[y_col]])) %>%
+    group_by(across(all_of(group_cols))) %>%
+    group_modify(function(d, key) {
+      x   <- d[[x_col]]; y <- d[[y_col]]
+      if (length(x) < 6) return(tibble())
+      m1  <- lm(y ~ x)
+      m2  <- lm(y ~ poly(x, 2))
+      mod <- if (AIC(m2) < AIC(m1) - delta_aic) m2 else m1
+      xs  <- seq(min(x), max(x), length.out = 200)
+      p   <- predict(mod, newdata = data.frame(x = xs), interval = "confidence")
+      out <- tibble(.fit = p[, "fit"], .lwr = p[, "lwr"], .upr = p[, "upr"])
+      out[[x_col]] <- xs
+      out
+    }) %>%
+    ungroup()
+}
 ```
 
 ---
@@ -113,10 +136,14 @@ cat("N per model:\n"); print(count(proc, model_size))
 ### Visualizations
 
 ```{r proc-viz-freq, fig.height=5}
+.sm <- fit_smart_smooth(proc, "log_freq", "procrustes_dist")
 proc %>%
   ggplot(aes(x = log_freq, y = procrustes_dist, colour = ord_dom)) +
   geom_point(alpha = 0.4, size = 0.9) +
-  geom_smooth(method = "lm", colour = "black", linewidth = 0.8) +
+  geom_ribbon(data = .sm, aes(x = log_freq, ymin = .lwr, ymax = .upr),
+              inherit.aes = FALSE, alpha = 0.15, fill = "grey40") +
+  geom_line(data = .sm, aes(x = log_freq, y = .fit),
+            inherit.aes = FALSE, colour = "black", linewidth = 0.8) +
   facet_wrap(~model_size, nrow = 1, scales = "free_x") +
   scale_colour_viridis_c(name = "Ordering dominance\n|RelFreq − 0.5|") +
   labs(x = "log(overall frequency)", y = "Procrustes distance",
@@ -126,12 +153,19 @@ proc %>%
 ```
 
 ```{r proc-viz-ord, fig.height=5}
+.sm <- fit_smart_smooth(proc, "ord_dom", "procrustes_dist",
+                        group_cols = c("model_size", "log_freq_bin"))
 proc %>%
   ggplot(aes(x = ord_dom, y = procrustes_dist, colour = log_freq_bin)) +
   geom_point(alpha = 0.4, size = 0.9) +
-  geom_smooth(method = "lm", se = TRUE) +
+  geom_ribbon(data = .sm, aes(x = ord_dom, ymin = .lwr, ymax = .upr,
+                               fill = log_freq_bin),
+              inherit.aes = FALSE, alpha = 0.2) +
+  geom_line(data = .sm, aes(x = ord_dom, y = .fit, colour = log_freq_bin),
+            inherit.aes = FALSE, linewidth = 0.8) +
   facet_wrap(~model_size, nrow = 1) +
-  scale_colour_brewer(palette = "Blues", name = "Frequency tertile") +
+  scale_colour_brewer(palette = "Blues", aesthetics = c("colour", "fill"),
+                      name = "Frequency tertile") +
   labs(x = "Ordering dominance |RelFreq − 0.5|", y = "Procrustes distance",
        title = "Procrustes distance vs ordering dominance") +
   theme_minimal() +
@@ -139,12 +173,18 @@ proc %>%
 ```
 
 ```{r proc-viz-interaction, fig.height=5}
-proc %>%
-  filter(!is.na(ord_dom_bin)) %>%
+.d  <- proc %>% filter(!is.na(ord_dom_bin))
+.sm <- fit_smart_smooth(.d, "log_freq", "procrustes_dist",
+                        group_cols = c("model_size", "ord_dom_bin"))
+.d %>%
   ggplot(aes(x = log_freq, y = procrustes_dist,
              colour = ord_dom_bin, fill = ord_dom_bin)) +
   geom_point(alpha = 0.2, size = 0.7) +
-  geom_smooth(method = "lm", se = TRUE) +
+  geom_ribbon(data = .sm, aes(x = log_freq, ymin = .lwr, ymax = .upr,
+                               fill = ord_dom_bin),
+              inherit.aes = FALSE, alpha = 0.2) +
+  geom_line(data = .sm, aes(x = log_freq, y = .fit, colour = ord_dom_bin),
+            inherit.aes = FALSE, linewidth = 0.8) +
   facet_wrap(~model_size, nrow = 1, scales = "free_x") +
   scale_colour_brewer(palette = "Set2", aesthetics = c("colour", "fill"),
                       name = "Ordering dominance") +
@@ -280,10 +320,14 @@ cat("N per model:\n"); print(count(cos, model_size))
 ### Visualizations
 
 ```{r cos-viz-freq, fig.height=5}
+.sm <- fit_smart_smooth(cos, "log_freq", "cosine_sim")
 cos %>%
   ggplot(aes(x = log_freq, y = cosine_sim, colour = ord_dom)) +
   geom_point(alpha = 0.4, size = 0.9) +
-  geom_smooth(method = "lm", colour = "black", linewidth = 0.8) +
+  geom_ribbon(data = .sm, aes(x = log_freq, ymin = .lwr, ymax = .upr),
+              inherit.aes = FALSE, alpha = 0.15, fill = "grey40") +
+  geom_line(data = .sm, aes(x = log_freq, y = .fit),
+            inherit.aes = FALSE, colour = "black", linewidth = 0.8) +
   facet_wrap(~model_size, nrow = 1, scales = "free_x") +
   scale_colour_viridis_c(name = "Ordering dominance\n|RelFreq − 0.5|") +
   labs(x = "log(overall frequency)", y = "Cosine similarity (AB vs BA)",
@@ -293,12 +337,19 @@ cos %>%
 ```
 
 ```{r cos-viz-ord, fig.height=5}
+.sm <- fit_smart_smooth(cos, "ord_dom", "cosine_sim",
+                        group_cols = c("model_size", "log_freq_bin"))
 cos %>%
   ggplot(aes(x = ord_dom, y = cosine_sim, colour = log_freq_bin)) +
   geom_point(alpha = 0.4, size = 0.9) +
-  geom_smooth(method = "lm", se = TRUE) +
+  geom_ribbon(data = .sm, aes(x = ord_dom, ymin = .lwr, ymax = .upr,
+                               fill = log_freq_bin),
+              inherit.aes = FALSE, alpha = 0.2) +
+  geom_line(data = .sm, aes(x = ord_dom, y = .fit, colour = log_freq_bin),
+            inherit.aes = FALSE, linewidth = 0.8) +
   facet_wrap(~model_size, nrow = 1) +
-  scale_colour_brewer(palette = "Blues", name = "Frequency tertile") +
+  scale_colour_brewer(palette = "Blues", aesthetics = c("colour", "fill"),
+                      name = "Frequency tertile") +
   labs(x = "Ordering dominance |RelFreq − 0.5|", y = "Cosine similarity (AB vs BA)",
        title = "In-context cosine similarity vs ordering dominance") +
   theme_minimal() +
@@ -306,12 +357,18 @@ cos %>%
 ```
 
 ```{r cos-viz-interaction, fig.height=5}
-cos %>%
-  filter(!is.na(ord_dom_bin)) %>%
+.d  <- cos %>% filter(!is.na(ord_dom_bin))
+.sm <- fit_smart_smooth(.d, "log_freq", "cosine_sim",
+                        group_cols = c("model_size", "ord_dom_bin"))
+.d %>%
   ggplot(aes(x = log_freq, y = cosine_sim,
              colour = ord_dom_bin, fill = ord_dom_bin)) +
   geom_point(alpha = 0.2, size = 0.7) +
-  geom_smooth(method = "lm", se = TRUE) +
+  geom_ribbon(data = .sm, aes(x = log_freq, ymin = .lwr, ymax = .upr,
+                               fill = ord_dom_bin),
+              inherit.aes = FALSE, alpha = 0.2) +
+  geom_line(data = .sm, aes(x = log_freq, y = .fit, colour = ord_dom_bin),
+            inherit.aes = FALSE, linewidth = 0.8) +
   facet_wrap(~model_size, nrow = 1, scales = "free_x") +
   scale_colour_brewer(palette = "Set2", aesthetics = c("colour", "fill"),
                       name = "Ordering dominance") +
@@ -452,11 +509,15 @@ cat("N per model:\n"); print(count(comp, model_size))
 ### Visualizations
 
 ```{r comp-viz-freq, fig.height=5}
+.sm <- fit_smart_smooth(comp, "log_freq", "LogCosSim")
 comp %>%
   ggplot(aes(x = log_freq, y = LogCosSim, colour = relfreq_c)) +
   geom_point(alpha = 0.4, size = 0.9) +
-  geom_smooth(method = "lm", colour = "black", linewidth = 0.8) +
   geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_ribbon(data = .sm, aes(x = log_freq, ymin = .lwr, ymax = .upr),
+              inherit.aes = FALSE, alpha = 0.15, fill = "grey40") +
+  geom_line(data = .sm, aes(x = log_freq, y = .fit),
+            inherit.aes = FALSE, colour = "black", linewidth = 0.8) +
   facet_wrap(~model_size, nrow = 1, scales = "free_x") +
   scale_colour_gradient2(
     low = "#2166ac", mid = "grey80", high = "#d6604d", midpoint = 0,
@@ -469,13 +530,20 @@ comp %>%
 ```
 
 ```{r comp-viz-relfreq, fig.height=5}
+.sm <- fit_smart_smooth(comp, "relfreq_c", "LogCosSim",
+                        group_cols = c("model_size", "log_freq_bin"))
 comp %>%
   ggplot(aes(x = relfreq_c, y = LogCosSim, colour = log_freq_bin)) +
   geom_point(alpha = 0.4, size = 0.9) +
-  geom_smooth(method = "lm", se = TRUE) +
   geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_ribbon(data = .sm, aes(x = relfreq_c, ymin = .lwr, ymax = .upr,
+                               fill = log_freq_bin),
+              inherit.aes = FALSE, alpha = 0.2) +
+  geom_line(data = .sm, aes(x = relfreq_c, y = .fit, colour = log_freq_bin),
+            inherit.aes = FALSE, linewidth = 0.8) +
   facet_wrap(~model_size, nrow = 1) +
-  scale_colour_brewer(palette = "Blues", name = "Frequency tertile") +
+  scale_colour_brewer(palette = "Blues", aesthetics = c("colour", "fill"),
+                      name = "Frequency tertile") +
   labs(x = "Relative frequency (RelFreq − 0.5)", y = "LogCosSim",
        title = "LogCosSim vs relative frequency") +
   theme_minimal() +
@@ -483,13 +551,19 @@ comp %>%
 ```
 
 ```{r comp-viz-interaction, fig.height=5}
-comp %>%
-  filter(!is.na(relfreq_bin)) %>%
+.d  <- comp %>% filter(!is.na(relfreq_bin))
+.sm <- fit_smart_smooth(.d, "log_freq", "LogCosSim",
+                        group_cols = c("model_size", "relfreq_bin"))
+.d %>%
   ggplot(aes(x = log_freq, y = LogCosSim,
              colour = relfreq_bin, fill = relfreq_bin)) +
   geom_point(alpha = 0.2, size = 0.7) +
-  geom_smooth(method = "lm", se = TRUE) +
   geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_ribbon(data = .sm, aes(x = log_freq, ymin = .lwr, ymax = .upr,
+                               fill = relfreq_bin),
+              inherit.aes = FALSE, alpha = 0.2) +
+  geom_line(data = .sm, aes(x = log_freq, y = .fit, colour = relfreq_bin),
+            inherit.aes = FALSE, linewidth = 0.8) +
   facet_wrap(~model_size, nrow = 1, scales = "free_x") +
   scale_colour_brewer(palette = "RdBu", direction = -1,
                       aesthetics = c("colour", "fill"),

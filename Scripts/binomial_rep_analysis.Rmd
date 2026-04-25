@@ -62,7 +62,7 @@ df <- df_raw %>%
     consistency      = -self_sim_AB,
     consistency_BA   = -self_sim_BA,
     mean_consistency = (consistency + consistency_BA) / 2,
-    model_size  = factor(model_size, levels = c("125m", "350m", "1.3b", "olmo-1b", "olmo-32b"))
+    model_size  = factor(model_size, levels = c("125m", "350m", "1.3b", "olmo-1b", "olmo-7b"))
   )
 
 # Label early / mid / final checkpoints per model
@@ -276,7 +276,7 @@ df_all_layers_final <- df_raw %>%
   semi_join(final_steps, by = c("model_size", "step")) %>%
   mutate(
     log_freq   = log1p(corpus_freq),
-    model_size = factor(model_size, levels = c("125m", "350m", "1.3b", "olmo-1b", "olmo-32b")),
+    model_size = factor(model_size, levels = c("125m", "350m", "1.3b", "olmo-1b", "olmo-7b")),
     layer_prop = layer / max(layer),   # normalise within each row (max varies by model)
   )
 
@@ -345,7 +345,7 @@ df_raw %>%
   inner_join(checkpoint_labels %>% select(model_size, step, ckpt_label),
              by = c("model_size", "step")) %>%
   mutate(
-    model_size = factor(model_size, levels = c("125m", "350m", "1.3b", "olmo-1b", "olmo-32b")),
+    model_size = factor(model_size, levels = c("125m", "350m", "1.3b", "olmo-1b", "olmo-7b")),
     ckpt_label = factor(ckpt_label, levels = c("early", "mid", "final"))
   ) %>%
   group_by(model_size, ckpt_label, layer) %>%
@@ -644,7 +644,7 @@ comp_wide <- comp_sim_raw %>%
                           labels = c("BA-dominant", "Balanced", "AB-dominant"),
                           include.lowest = TRUE),
     model_size      = factor(model_size,
-                             levels = c("125m", "350m", "1.3b", "olmo-1b", "olmo-32b"))
+                             levels = c("125m", "350m", "1.3b", "olmo-1b", "olmo-7b"))
   )
 
 comp_model_sizes <- levels(droplevels(comp_wide$model_size))

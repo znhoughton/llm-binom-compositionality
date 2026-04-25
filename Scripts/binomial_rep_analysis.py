@@ -114,14 +114,13 @@ EXTRA_MODEL_CONFIGS = {
         "trust_remote_code": True,
         "torch_dtype":       "float16",
     },
-    "allenai/OLMo-2-0325-32B": {
-        "size_label":        "olmo-32b",
-        "tokenizer":         "allenai/OLMo-2-0325-32B",
-        "batch_size":        8,
-        "chunk_size":        25,
+    "allenai/OLMo-2-1124-7B": {
+        "size_label":        "olmo-7b",
+        "tokenizer":         "allenai/OLMo-2-1124-7B",
+        "batch_size":        32,
+        "chunk_size":        50,
         "trust_remote_code": True,
         "torch_dtype":       "float16",
-        "device_map":        "auto",
     },
 }
 

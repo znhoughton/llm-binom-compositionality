@@ -28,8 +28,8 @@ from pathlib import Path
 
 import numpy as np
 from joblib import Parallel, delayed
-from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import StratifiedKFold, cross_val_predict
 from tqdm import tqdm
 import torch
@@ -56,9 +56,8 @@ FIELDNAMES = [
     "phrase_AB", "layer", "label", "logit",
 ]
 
-N_FOLDS     = 10    # stratified k-fold splits
-N_PCA_COMPS = 100   # PCA components before logistic regression
-N_JOBS      = 12    # joblib workers for parallel logistic regression
+N_FOLDS = 10    # stratified k-fold splits
+N_JOBS  = 12    # joblib workers for parallel logistic regression
 
 
 # ---------------------------------------------------------------------------
@@ -102,16 +101,11 @@ def _logreg_cv_one(A_arr: np.ndarray, B_arr: np.ndarray, n: int):
     if n < N_FOLDS * 2:
         return None, None
 
-    X = np.vstack([A_arr[:n], B_arr[:n]])
-    X = X - X.mean(axis=0)
-
-    K = min(N_PCA_COMPS, n - 1)
-    X_proj = PCA(n_components=K).fit_transform(X)
-
+    X      = StandardScaler().fit_transform(np.vstack([A_arr[:n], B_arr[:n]]))
     y      = np.array([0] * n + [1] * n, dtype=np.int32)
     clf    = LogisticRegression(C=1.0, max_iter=1000, solver="lbfgs")
     cv     = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
-    logits = cross_val_predict(clf, X_proj, y, cv=cv,
+    logits = cross_val_predict(clf, X, y, cv=cv,
                                method="decision_function", n_jobs=1)
     return logits, y
 

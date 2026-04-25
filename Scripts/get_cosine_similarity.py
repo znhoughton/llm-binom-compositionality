@@ -105,12 +105,14 @@ def process_checkpoint(
     print(f"\n  Checkpoint: {ckpt['checkpoint']}  "
           f"(step={ckpt['step']}, tokens={ckpt['tokens']:,})")
 
-    tmp_cache = tempfile.mkdtemp(prefix="hf_cos_")
+    use_tmp_cache = bool(ckpt["tag"])
+    tmp_cache = tempfile.mkdtemp(prefix="hf_cos_") if use_tmp_cache else None
     model = None
     try:
-        load_kw = dict(low_cpu_mem_usage=True, cache_dir=tmp_cache)
+        load_kw = dict(low_cpu_mem_usage=True)
         if ckpt["tag"]:
             load_kw["revision"] = ckpt["tag"]
+            load_kw["cache_dir"] = tmp_cache
         model = AutoModel.from_pretrained(model_name, **load_kw).to(device).eval()
 
         all_map = {
@@ -180,7 +182,8 @@ def process_checkpoint(
         if model is not None:
             del model
         torch.cuda.empty_cache()
-        shutil.rmtree(tmp_cache, ignore_errors=True)
+        if tmp_cache:
+            shutil.rmtree(tmp_cache, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------

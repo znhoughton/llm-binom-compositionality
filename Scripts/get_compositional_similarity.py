@@ -296,7 +296,7 @@ def _checkpoints_from_csv(csv_path: str) -> dict:
     for model_name, grp in df.drop_duplicates().groupby("model"):
         result[model_name] = [
             {"checkpoint": row["checkpoint"],
-             "tag":        row["checkpoint"],
+             "tag":        None if row["checkpoint"] == "final" else row["checkpoint"],
              "step":       int(row["step"]),
              "tokens":     int(row["tokens"])}
             for _, row in grp.iterrows()

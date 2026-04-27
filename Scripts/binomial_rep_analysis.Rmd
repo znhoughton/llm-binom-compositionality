@@ -375,6 +375,218 @@ proc_brms_ss %>%
   theme_minimal()
 ```
 
+### Training Trajectory (All Checkpoints, Final Layer)
+
+```{r proc-ckpt-prep}
+proc_ckpt <- proc_raw %>%
+  mutate(model_size = factor(model_size, levels = MODEL_LEVELS)) %>%
+  group_by(model_size) %>%
+  filter(layer == max(layer)) %>%
+  ungroup() %>%
+  join_freqs() %>%
+  filter(!is.na(overall_freq), overall_freq > 0,
+         !is.na(rel_freq), !is.na(procrustes_dist),
+         tokens > 0) %>%
+  mutate(
+    log_freq    = log(overall_freq),
+    log_freq_sc = sc(log_freq),
+    ord_dom     = abs(rel_freq - 0.5),
+    ord_dom_sc  = sc(ord_dom),
+    log_tokens  = log(tokens),
+    ord_dom_bin = factor(
+      case_when(ntile(ord_dom, 3) == 1 ~ "Balanced",
+                ntile(ord_dom, 3) == 2 ~ "Moderate",
+                ntile(ord_dom, 3) == 3 ~ "Dominant"),
+      levels = c("Balanced", "Moderate", "Dominant")
+    ),
+    model_size  = factor(model_size, levels = MODEL_LEVELS)
+  )
+
+proc_ckpt_sizes <- levels(droplevels(proc_ckpt$model_size))
+cat("Models:", paste(proc_ckpt_sizes, collapse = ", "), "\n")
+cat("N per model:\n"); print(count(proc_ckpt, model_size))
+```
+
+```{r proc-ckpt-viz, fig.height=5}
+.d  <- proc_ckpt %>% filter(!is.na(ord_dom_bin))
+.sm <- fit_smart_smooth(.d, "log_tokens", "procrustes_dist",
+                        group_cols = c("model_size", "ord_dom_bin"))
+.d %>%
+  ggplot(aes(x = log_tokens, y = procrustes_dist,
+             colour = ord_dom_bin, fill = ord_dom_bin)) +
+  geom_point(alpha = 0.2, size = 0.7) +
+  geom_ribbon(data = .sm, aes(x = log_tokens, ymin = .lwr, ymax = .upr,
+                               fill = ord_dom_bin),
+              inherit.aes = FALSE, alpha = 0.2) +
+  geom_line(data = .sm, aes(x = log_tokens, y = .fit, colour = ord_dom_bin),
+            inherit.aes = FALSE, linewidth = 0.8) +
+  facet_wrap(~model_size, nrow = 1, scales = "free_x") +
+  scale_colour_brewer(palette = "Set2", aesthetics = c("colour", "fill"),
+                      name = "Ordering dominance") +
+  labs(x = "log(training tokens)", y = "Procrustes distance",
+       title = "Procrustes distance across training (final layer)") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+```{r proc-ckpt-brms, results="hide"}
+proc_brms_ckpt <- proc_ckpt_sizes %>%
+  set_names() %>%
+  map(function(size) {
+    d <- proc_ckpt %>%
+      filter(model_size == size) %>%
+      mutate(
+        proc_sc       = sc(procrustes_dist),
+        log_freq_sc   = sc(log_freq),
+        ord_dom_sc    = sc(ord_dom),
+        log_tokens_sc = sc(log_tokens)
+      )
+    brm(
+      proc_sc ~ log_freq_sc * ord_dom_sc * log_tokens_sc +
+        (log_tokens_sc | phrase_AB),
+      data    = d,
+      prior   = c(base_priors, prior(lkj(2), class = cor)),
+      family  = gaussian(),
+      cores   = 4, iter = 2000, seed = 42,
+      control = list(adapt_delta = 0.9),
+      file    = sprintf("../results/m_proc_ckpt_%s", size)
+    )
+  })
+```
+
+```{r proc-ckpt-coef, fig.height=4}
+proc_brms_ckpt %>%
+  imap_dfr(function(m, size) {
+    as_draws_df(m) %>%
+      select(starts_with("b_"), -b_Intercept) %>%
+      pivot_longer(everything(), names_to = "term", values_to = "estimate") %>%
+      mutate(model_size = size)
+  }) %>%
+  mutate(
+    model_size = factor(model_size, levels = MODEL_LEVELS),
+    term = recode(term,
+                  b_log_freq_sc                            = "log freq",
+                  b_ord_dom_sc                             = "ordering dominance",
+                  b_log_tokens_sc                          = "log tokens",
+                  `b_log_freq_sc:ord_dom_sc`               = "freq × dom",
+                  `b_log_freq_sc:log_tokens_sc`            = "freq × tokens",
+                  `b_ord_dom_sc:log_tokens_sc`             = "dom × tokens",
+                  `b_log_freq_sc:ord_dom_sc:log_tokens_sc` = "freq × dom × tokens")
+  ) %>%
+  ggplot(aes(x = estimate, y = term, fill = model_size)) +
+  stat_halfeye(position = position_dodge(width = 0.6), alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  scale_fill_brewer(palette = "Set1", name = "Model") +
+  labs(x = "Posterior estimate", y = NULL,
+       title = "Procrustes distance: training trajectory model") +
+  theme_minimal()
+```
+
+### Layer-wise Pattern (All Layers, Final Checkpoint)
+
+```{r proc-layer-prep}
+proc_layer <- proc_raw %>%
+  mutate(model_size = factor(model_size, levels = MODEL_LEVELS)) %>%
+  group_by(model_size) %>%
+  filter(tokens == max(tokens)) %>%
+  ungroup() %>%
+  join_freqs() %>%
+  filter(!is.na(overall_freq), overall_freq > 0,
+         !is.na(rel_freq), !is.na(procrustes_dist)) %>%
+  mutate(
+    log_freq    = log(overall_freq),
+    log_freq_sc = sc(log_freq),
+    ord_dom     = abs(rel_freq - 0.5),
+    ord_dom_sc  = sc(ord_dom),
+    ord_dom_bin = factor(
+      case_when(ntile(ord_dom, 3) == 1 ~ "Balanced",
+                ntile(ord_dom, 3) == 2 ~ "Moderate",
+                ntile(ord_dom, 3) == 3 ~ "Dominant"),
+      levels = c("Balanced", "Moderate", "Dominant")
+    ),
+    model_size  = factor(model_size, levels = MODEL_LEVELS)
+  )
+
+proc_layer_sizes <- levels(droplevels(proc_layer$model_size))
+cat("Models:", paste(proc_layer_sizes, collapse = ", "), "\n")
+cat("N per model:\n"); print(count(proc_layer, model_size))
+```
+
+```{r proc-layer-viz, fig.height=5}
+.d  <- proc_layer %>% filter(!is.na(ord_dom_bin))
+.sm <- fit_smart_smooth(.d, "layer", "procrustes_dist",
+                        group_cols = c("model_size", "ord_dom_bin"))
+.d %>%
+  ggplot(aes(x = layer, y = procrustes_dist,
+             colour = ord_dom_bin, fill = ord_dom_bin)) +
+  geom_point(alpha = 0.2, size = 0.7) +
+  geom_ribbon(data = .sm, aes(x = layer, ymin = .lwr, ymax = .upr,
+                               fill = ord_dom_bin),
+              inherit.aes = FALSE, alpha = 0.2) +
+  geom_line(data = .sm, aes(x = layer, y = .fit, colour = ord_dom_bin),
+            inherit.aes = FALSE, linewidth = 0.8) +
+  facet_wrap(~model_size, nrow = 1, scales = "free_x") +
+  scale_colour_brewer(palette = "Set2", aesthetics = c("colour", "fill"),
+                      name = "Ordering dominance") +
+  labs(x = "Layer", y = "Procrustes distance",
+       title = "Procrustes distance across layers (final checkpoint)") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+```{r proc-layer-brms, results="hide"}
+proc_brms_layer <- proc_layer_sizes %>%
+  set_names() %>%
+  map(function(size) {
+    d <- proc_layer %>%
+      filter(model_size == size) %>%
+      mutate(
+        proc_sc     = sc(procrustes_dist),
+        log_freq_sc = sc(log_freq),
+        ord_dom_sc  = sc(ord_dom),
+        layer_sc    = sc(layer)
+      )
+    brm(
+      proc_sc ~ log_freq_sc * ord_dom_sc * layer_sc +
+        (layer_sc | phrase_AB),
+      data    = d,
+      prior   = c(base_priors, prior(lkj(2), class = cor)),
+      family  = gaussian(),
+      cores   = 4, iter = 2000, seed = 42,
+      control = list(adapt_delta = 0.9),
+      file    = sprintf("../results/m_proc_layer_%s", size)
+    )
+  })
+```
+
+```{r proc-layer-coef, fig.height=4}
+proc_brms_layer %>%
+  imap_dfr(function(m, size) {
+    as_draws_df(m) %>%
+      select(starts_with("b_"), -b_Intercept) %>%
+      pivot_longer(everything(), names_to = "term", values_to = "estimate") %>%
+      mutate(model_size = size)
+  }) %>%
+  mutate(
+    model_size = factor(model_size, levels = MODEL_LEVELS),
+    term = recode(term,
+                  b_log_freq_sc                       = "log freq",
+                  b_ord_dom_sc                        = "ordering dominance",
+                  b_layer_sc                          = "layer",
+                  `b_log_freq_sc:ord_dom_sc`          = "freq × dom",
+                  `b_log_freq_sc:layer_sc`            = "freq × layer",
+                  `b_ord_dom_sc:layer_sc`             = "dom × layer",
+                  `b_log_freq_sc:ord_dom_sc:layer_sc` = "freq × dom × layer")
+  ) %>%
+  ggplot(aes(x = estimate, y = term, fill = model_size)) +
+  stat_halfeye(position = position_dodge(width = 0.6), alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  scale_fill_brewer(palette = "Set1", name = "Model") +
+  labs(x = "Posterior estimate", y = NULL,
+       title = "Procrustes distance: layer-wise pattern model") +
+  theme_minimal()
+```
+
 ---
 
 ## In-Context Cosine Similarity (AB vs BA)
@@ -660,6 +872,222 @@ cos_brms_ss %>%
   theme_minimal()
 ```
 
+### Training Trajectory (All Checkpoints, Final Layer)
+
+```{r cos-ckpt-prep}
+cos_ckpt <- cos_raw %>%
+  mutate(model_size = factor(model_size, levels = MODEL_LEVELS)) %>%
+  group_by(model, model_size, checkpoint, step, tokens, phrase_AB, layer) %>%
+  summarise(cosine_sim = mean(cosine_sim, na.rm = TRUE), .groups = "drop") %>%
+  group_by(model_size) %>%
+  filter(layer == max(layer)) %>%
+  ungroup() %>%
+  join_freqs() %>%
+  filter(!is.na(overall_freq), overall_freq > 0,
+         !is.na(rel_freq), !is.na(cosine_sim),
+         tokens > 0) %>%
+  mutate(
+    log_freq    = log(overall_freq),
+    log_freq_sc = sc(log_freq),
+    ord_dom     = abs(rel_freq - 0.5),
+    ord_dom_sc  = sc(ord_dom),
+    log_tokens  = log(tokens),
+    ord_dom_bin = factor(
+      case_when(ntile(ord_dom, 3) == 1 ~ "Balanced",
+                ntile(ord_dom, 3) == 2 ~ "Moderate",
+                ntile(ord_dom, 3) == 3 ~ "Dominant"),
+      levels = c("Balanced", "Moderate", "Dominant")
+    ),
+    model_size  = factor(model_size, levels = MODEL_LEVELS)
+  )
+
+cos_ckpt_sizes <- levels(droplevels(cos_ckpt$model_size))
+cat("Models:", paste(cos_ckpt_sizes, collapse = ", "), "\n")
+cat("N per model:\n"); print(count(cos_ckpt, model_size))
+```
+
+```{r cos-ckpt-viz, fig.height=5}
+.d  <- cos_ckpt %>% filter(!is.na(ord_dom_bin))
+.sm <- fit_smart_smooth(.d, "log_tokens", "cosine_sim",
+                        group_cols = c("model_size", "ord_dom_bin"))
+.d %>%
+  ggplot(aes(x = log_tokens, y = cosine_sim,
+             colour = ord_dom_bin, fill = ord_dom_bin)) +
+  geom_point(alpha = 0.2, size = 0.7) +
+  geom_ribbon(data = .sm, aes(x = log_tokens, ymin = .lwr, ymax = .upr,
+                               fill = ord_dom_bin),
+              inherit.aes = FALSE, alpha = 0.2) +
+  geom_line(data = .sm, aes(x = log_tokens, y = .fit, colour = ord_dom_bin),
+            inherit.aes = FALSE, linewidth = 0.8) +
+  facet_wrap(~model_size, nrow = 1, scales = "free_x") +
+  scale_colour_brewer(palette = "Set2", aesthetics = c("colour", "fill"),
+                      name = "Ordering dominance") +
+  labs(x = "log(training tokens)", y = "Cosine similarity (AB vs BA)",
+       title = "Cosine similarity across training (final layer)") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+```{r cos-ckpt-brms, results="hide"}
+cos_brms_ckpt <- cos_ckpt_sizes %>%
+  set_names() %>%
+  map(function(size) {
+    d <- cos_ckpt %>%
+      filter(model_size == size) %>%
+      mutate(
+        cos_sc        = sc(cosine_sim),
+        log_freq_sc   = sc(log_freq),
+        ord_dom_sc    = sc(ord_dom),
+        log_tokens_sc = sc(log_tokens)
+      )
+    brm(
+      cos_sc ~ log_freq_sc * ord_dom_sc * log_tokens_sc +
+        (log_tokens_sc | phrase_AB),
+      data    = d,
+      prior   = c(base_priors, prior(lkj(2), class = cor)),
+      family  = gaussian(),
+      cores   = 4, iter = 2000, seed = 42,
+      control = list(adapt_delta = 0.9),
+      file    = sprintf("../results/m_cos_ckpt_%s", size)
+    )
+  })
+```
+
+```{r cos-ckpt-coef, fig.height=4}
+cos_brms_ckpt %>%
+  imap_dfr(function(m, size) {
+    as_draws_df(m) %>%
+      select(starts_with("b_"), -b_Intercept) %>%
+      pivot_longer(everything(), names_to = "term", values_to = "estimate") %>%
+      mutate(model_size = size)
+  }) %>%
+  mutate(
+    model_size = factor(model_size, levels = MODEL_LEVELS),
+    term = recode(term,
+                  b_log_freq_sc                            = "log freq",
+                  b_ord_dom_sc                             = "ordering dominance",
+                  b_log_tokens_sc                          = "log tokens",
+                  `b_log_freq_sc:ord_dom_sc`               = "freq × dom",
+                  `b_log_freq_sc:log_tokens_sc`            = "freq × tokens",
+                  `b_ord_dom_sc:log_tokens_sc`             = "dom × tokens",
+                  `b_log_freq_sc:ord_dom_sc:log_tokens_sc` = "freq × dom × tokens")
+  ) %>%
+  ggplot(aes(x = estimate, y = term, fill = model_size)) +
+  stat_halfeye(position = position_dodge(width = 0.6), alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  scale_fill_brewer(palette = "Set1", name = "Model") +
+  labs(x = "Posterior estimate", y = NULL,
+       title = "Cosine similarity: training trajectory model") +
+  theme_minimal()
+```
+
+### Layer-wise Pattern (All Layers, Final Checkpoint)
+
+```{r cos-layer-prep}
+cos_layer <- cos_raw %>%
+  mutate(model_size = factor(model_size, levels = MODEL_LEVELS)) %>%
+  group_by(model, model_size, checkpoint, step, tokens, phrase_AB, layer) %>%
+  summarise(cosine_sim = mean(cosine_sim, na.rm = TRUE), .groups = "drop") %>%
+  group_by(model_size) %>%
+  filter(tokens == max(tokens)) %>%
+  ungroup() %>%
+  join_freqs() %>%
+  filter(!is.na(overall_freq), overall_freq > 0,
+         !is.na(rel_freq), !is.na(cosine_sim)) %>%
+  mutate(
+    log_freq    = log(overall_freq),
+    log_freq_sc = sc(log_freq),
+    ord_dom     = abs(rel_freq - 0.5),
+    ord_dom_sc  = sc(ord_dom),
+    ord_dom_bin = factor(
+      case_when(ntile(ord_dom, 3) == 1 ~ "Balanced",
+                ntile(ord_dom, 3) == 2 ~ "Moderate",
+                ntile(ord_dom, 3) == 3 ~ "Dominant"),
+      levels = c("Balanced", "Moderate", "Dominant")
+    ),
+    model_size  = factor(model_size, levels = MODEL_LEVELS)
+  )
+
+cos_layer_sizes <- levels(droplevels(cos_layer$model_size))
+cat("Models:", paste(cos_layer_sizes, collapse = ", "), "\n")
+cat("N per model:\n"); print(count(cos_layer, model_size))
+```
+
+```{r cos-layer-viz, fig.height=5}
+.d  <- cos_layer %>% filter(!is.na(ord_dom_bin))
+.sm <- fit_smart_smooth(.d, "layer", "cosine_sim",
+                        group_cols = c("model_size", "ord_dom_bin"))
+.d %>%
+  ggplot(aes(x = layer, y = cosine_sim,
+             colour = ord_dom_bin, fill = ord_dom_bin)) +
+  geom_point(alpha = 0.2, size = 0.7) +
+  geom_ribbon(data = .sm, aes(x = layer, ymin = .lwr, ymax = .upr,
+                               fill = ord_dom_bin),
+              inherit.aes = FALSE, alpha = 0.2) +
+  geom_line(data = .sm, aes(x = layer, y = .fit, colour = ord_dom_bin),
+            inherit.aes = FALSE, linewidth = 0.8) +
+  facet_wrap(~model_size, nrow = 1, scales = "free_x") +
+  scale_colour_brewer(palette = "Set2", aesthetics = c("colour", "fill"),
+                      name = "Ordering dominance") +
+  labs(x = "Layer", y = "Cosine similarity (AB vs BA)",
+       title = "Cosine similarity across layers (final checkpoint)") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+```{r cos-layer-brms, results="hide"}
+cos_brms_layer <- cos_layer_sizes %>%
+  set_names() %>%
+  map(function(size) {
+    d <- cos_layer %>%
+      filter(model_size == size) %>%
+      mutate(
+        cos_sc      = sc(cosine_sim),
+        log_freq_sc = sc(log_freq),
+        ord_dom_sc  = sc(ord_dom),
+        layer_sc    = sc(layer)
+      )
+    brm(
+      cos_sc ~ log_freq_sc * ord_dom_sc * layer_sc +
+        (layer_sc | phrase_AB),
+      data    = d,
+      prior   = c(base_priors, prior(lkj(2), class = cor)),
+      family  = gaussian(),
+      cores   = 4, iter = 2000, seed = 42,
+      control = list(adapt_delta = 0.9),
+      file    = sprintf("../results/m_cos_layer_%s", size)
+    )
+  })
+```
+
+```{r cos-layer-coef, fig.height=4}
+cos_brms_layer %>%
+  imap_dfr(function(m, size) {
+    as_draws_df(m) %>%
+      select(starts_with("b_"), -b_Intercept) %>%
+      pivot_longer(everything(), names_to = "term", values_to = "estimate") %>%
+      mutate(model_size = size)
+  }) %>%
+  mutate(
+    model_size = factor(model_size, levels = MODEL_LEVELS),
+    term = recode(term,
+                  b_log_freq_sc                       = "log freq",
+                  b_ord_dom_sc                        = "ordering dominance",
+                  b_layer_sc                          = "layer",
+                  `b_log_freq_sc:ord_dom_sc`          = "freq × dom",
+                  `b_log_freq_sc:layer_sc`            = "freq × layer",
+                  `b_ord_dom_sc:layer_sc`             = "dom × layer",
+                  `b_log_freq_sc:ord_dom_sc:layer_sc` = "freq × dom × layer")
+  ) %>%
+  ggplot(aes(x = estimate, y = term, fill = model_size)) +
+  stat_halfeye(position = position_dodge(width = 0.6), alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  scale_fill_brewer(palette = "Set1", name = "Model") +
+  labs(x = "Posterior estimate", y = NULL,
+       title = "Cosine similarity: layer-wise pattern model") +
+  theme_minimal()
+```
+
 ---
 
 ## Compositional Similarity (LogCosSim)
@@ -863,4 +1291,228 @@ map(comp_sizes, function(size) {
 }) %>%
   wrap_plots(nrow = 1) +
   plot_annotation(title = "Conditional effects: frequency × relative frequency (LogCosSim)")
+```
+
+### Training Trajectory (All Checkpoints, Final Layer)
+
+```{r comp-ckpt-prep}
+comp_ckpt <- comp_raw %>%
+  mutate(model_size = factor(model_size, levels = MODEL_LEVELS)) %>%
+  group_by(model_size) %>%
+  filter(layer == max(layer)) %>%
+  ungroup() %>%
+  pivot_wider(names_from = ordering, values_from = mean_cosine_sim,
+              names_prefix = "comp_sim_") %>%
+  join_freqs() %>%
+  filter(!is.na(overall_freq), overall_freq > 0,
+         !is.na(rel_freq),
+         !is.na(comp_sim_AB), comp_sim_AB > 0,
+         !is.na(comp_sim_BA), comp_sim_BA > 0,
+         tokens > 0) %>%
+  mutate(
+    LogCosSim   = log(comp_sim_AB / comp_sim_BA),
+    log_freq    = log(overall_freq),
+    log_freq_sc = sc(log_freq),
+    relfreq_c   = rel_freq - 0.5,
+    log_tokens  = log(tokens),
+    relfreq_bin = factor(
+      case_when(ntile(relfreq_c, 3) == 1 ~ "BA-dominant",
+                ntile(relfreq_c, 3) == 2 ~ "Balanced",
+                ntile(relfreq_c, 3) == 3 ~ "AB-dominant"),
+      levels = c("BA-dominant", "Balanced", "AB-dominant")
+    ),
+    model_size  = factor(model_size, levels = MODEL_LEVELS)
+  )
+
+comp_ckpt_sizes <- levels(droplevels(comp_ckpt$model_size))
+cat("Models:", paste(comp_ckpt_sizes, collapse = ", "), "\n")
+cat("N per model:\n"); print(count(comp_ckpt, model_size))
+```
+
+```{r comp-ckpt-viz, fig.height=5}
+.d  <- comp_ckpt %>% filter(!is.na(relfreq_bin))
+.sm <- fit_smart_smooth(.d, "log_tokens", "LogCosSim",
+                        group_cols = c("model_size", "relfreq_bin"))
+.d %>%
+  ggplot(aes(x = log_tokens, y = LogCosSim,
+             colour = relfreq_bin, fill = relfreq_bin)) +
+  geom_point(alpha = 0.2, size = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_ribbon(data = .sm, aes(x = log_tokens, ymin = .lwr, ymax = .upr,
+                               fill = relfreq_bin),
+              inherit.aes = FALSE, alpha = 0.2) +
+  geom_line(data = .sm, aes(x = log_tokens, y = .fit, colour = relfreq_bin),
+            inherit.aes = FALSE, linewidth = 0.8) +
+  facet_wrap(~model_size, nrow = 1, scales = "free_x") +
+  scale_colour_brewer(palette = "RdBu", direction = -1,
+                      aesthetics = c("colour", "fill"),
+                      name = "Ordering preference") +
+  labs(x = "log(training tokens)", y = "LogCosSim",
+       title = "LogCosSim across training (final layer)") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+```{r comp-ckpt-brms, results="hide"}
+comp_brms_ckpt <- comp_ckpt_sizes %>%
+  set_names() %>%
+  map(function(size) {
+    d <- comp_ckpt %>%
+      filter(model_size == size) %>%
+      mutate(
+        LogCosSim_sc  = sc(LogCosSim),
+        log_freq_sc   = sc(log_freq),
+        relfreq_c     = rel_freq - 0.5,
+        log_tokens_sc = sc(log_tokens)
+      )
+    brm(
+      LogCosSim_sc ~ log_freq_sc * relfreq_c * log_tokens_sc +
+        (log_tokens_sc | phrase_AB),
+      data    = d,
+      prior   = c(base_priors, prior(lkj(2), class = cor)),
+      family  = gaussian(),
+      cores   = 4, iter = 2000, seed = 42,
+      control = list(adapt_delta = 0.9),
+      file    = sprintf("../results/m_comp_ckpt_%s", size)
+    )
+  })
+```
+
+```{r comp-ckpt-coef, fig.height=4}
+comp_brms_ckpt %>%
+  imap_dfr(function(m, size) {
+    as_draws_df(m) %>%
+      select(starts_with("b_"), -b_Intercept) %>%
+      pivot_longer(everything(), names_to = "term", values_to = "estimate") %>%
+      mutate(model_size = size)
+  }) %>%
+  mutate(
+    model_size = factor(model_size, levels = MODEL_LEVELS),
+    term = recode(term,
+                  b_log_freq_sc                          = "log freq",
+                  b_relfreq_c                            = "relative freq",
+                  b_log_tokens_sc                        = "log tokens",
+                  `b_log_freq_sc:relfreq_c`              = "freq × relfreq",
+                  `b_log_freq_sc:log_tokens_sc`          = "freq × tokens",
+                  `b_relfreq_c:log_tokens_sc`            = "relfreq × tokens",
+                  `b_log_freq_sc:relfreq_c:log_tokens_sc` = "freq × relfreq × tokens")
+  ) %>%
+  ggplot(aes(x = estimate, y = term, fill = model_size)) +
+  stat_halfeye(position = position_dodge(width = 0.6), alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  scale_fill_brewer(palette = "Set1", name = "Model") +
+  labs(x = "Posterior estimate", y = NULL,
+       title = "LogCosSim: training trajectory model") +
+  theme_minimal()
+```
+
+### Layer-wise Pattern (All Layers, Final Checkpoint)
+
+```{r comp-layer-prep}
+comp_layer <- comp_raw %>%
+  mutate(model_size = factor(model_size, levels = MODEL_LEVELS)) %>%
+  group_by(model_size) %>%
+  filter(tokens == max(tokens)) %>%
+  ungroup() %>%
+  pivot_wider(names_from = ordering, values_from = mean_cosine_sim,
+              names_prefix = "comp_sim_") %>%
+  join_freqs() %>%
+  filter(!is.na(overall_freq), overall_freq > 0,
+         !is.na(rel_freq),
+         !is.na(comp_sim_AB), comp_sim_AB > 0,
+         !is.na(comp_sim_BA), comp_sim_BA > 0) %>%
+  mutate(
+    LogCosSim   = log(comp_sim_AB / comp_sim_BA),
+    log_freq    = log(overall_freq),
+    log_freq_sc = sc(log_freq),
+    relfreq_c   = rel_freq - 0.5,
+    relfreq_bin = factor(
+      case_when(ntile(relfreq_c, 3) == 1 ~ "BA-dominant",
+                ntile(relfreq_c, 3) == 2 ~ "Balanced",
+                ntile(relfreq_c, 3) == 3 ~ "AB-dominant"),
+      levels = c("BA-dominant", "Balanced", "AB-dominant")
+    ),
+    model_size  = factor(model_size, levels = MODEL_LEVELS)
+  )
+
+comp_layer_sizes <- levels(droplevels(comp_layer$model_size))
+cat("Models:", paste(comp_layer_sizes, collapse = ", "), "\n")
+cat("N per model:\n"); print(count(comp_layer, model_size))
+```
+
+```{r comp-layer-viz, fig.height=5}
+.d  <- comp_layer %>% filter(!is.na(relfreq_bin))
+.sm <- fit_smart_smooth(.d, "layer", "LogCosSim",
+                        group_cols = c("model_size", "relfreq_bin"))
+.d %>%
+  ggplot(aes(x = layer, y = LogCosSim,
+             colour = relfreq_bin, fill = relfreq_bin)) +
+  geom_point(alpha = 0.2, size = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_ribbon(data = .sm, aes(x = layer, ymin = .lwr, ymax = .upr,
+                               fill = relfreq_bin),
+              inherit.aes = FALSE, alpha = 0.2) +
+  geom_line(data = .sm, aes(x = layer, y = .fit, colour = relfreq_bin),
+            inherit.aes = FALSE, linewidth = 0.8) +
+  facet_wrap(~model_size, nrow = 1, scales = "free_x") +
+  scale_colour_brewer(palette = "RdBu", direction = -1,
+                      aesthetics = c("colour", "fill"),
+                      name = "Ordering preference") +
+  labs(x = "Layer", y = "LogCosSim",
+       title = "LogCosSim across layers (final checkpoint)") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+```{r comp-layer-brms, results="hide"}
+comp_brms_layer <- comp_layer_sizes %>%
+  set_names() %>%
+  map(function(size) {
+    d <- comp_layer %>%
+      filter(model_size == size) %>%
+      mutate(
+        LogCosSim_sc = sc(LogCosSim),
+        log_freq_sc  = sc(log_freq),
+        relfreq_c    = rel_freq - 0.5,
+        layer_sc     = sc(layer)
+      )
+    brm(
+      LogCosSim_sc ~ log_freq_sc * relfreq_c * layer_sc +
+        (layer_sc | phrase_AB),
+      data    = d,
+      prior   = c(base_priors, prior(lkj(2), class = cor)),
+      family  = gaussian(),
+      cores   = 4, iter = 2000, seed = 42,
+      control = list(adapt_delta = 0.9),
+      file    = sprintf("../results/m_comp_layer_%s", size)
+    )
+  })
+```
+
+```{r comp-layer-coef, fig.height=4}
+comp_brms_layer %>%
+  imap_dfr(function(m, size) {
+    as_draws_df(m) %>%
+      select(starts_with("b_"), -b_Intercept) %>%
+      pivot_longer(everything(), names_to = "term", values_to = "estimate") %>%
+      mutate(model_size = size)
+  }) %>%
+  mutate(
+    model_size = factor(model_size, levels = MODEL_LEVELS),
+    term = recode(term,
+                  b_log_freq_sc                      = "log freq",
+                  b_relfreq_c                        = "relative freq",
+                  b_layer_sc                         = "layer",
+                  `b_log_freq_sc:relfreq_c`          = "freq × relfreq",
+                  `b_log_freq_sc:layer_sc`           = "freq × layer",
+                  `b_relfreq_c:layer_sc`             = "relfreq × layer",
+                  `b_log_freq_sc:relfreq_c:layer_sc` = "freq × relfreq × layer")
+  ) %>%
+  ggplot(aes(x = estimate, y = term, fill = model_size)) +
+  stat_halfeye(position = position_dodge(width = 0.6), alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  scale_fill_brewer(palette = "Set1", name = "Model") +
+  labs(x = "Posterior estimate", y = NULL,
+       title = "LogCosSim: layer-wise pattern model") +
+  theme_minimal()
 ```

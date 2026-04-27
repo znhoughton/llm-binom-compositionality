@@ -21,6 +21,7 @@ python Scripts/binomial_rep_analysis.py
 echo -e "\n--- Cosine similarity (BabyLM + OLMo; all layers, 10 checkpoints) ---"
 # --checkpoints-from pins BabyLM to the exact checkpoints Procrustes used.
 # OLMo models (not in that CSV) fall back to 10 log-sampled checkpoints via resolve_checkpoints.
+# Output is one row per (model, checkpoint, phrase_AB, layer) — mean cosine_sim across ~500 sentence contexts.
 python Scripts/get_cosine_similarity.py \
     --layers all \
     --n-checkpoints 10 \

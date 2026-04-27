@@ -183,17 +183,16 @@ def process_checkpoint(
                     sims = paired_cosine_sim(A[:n], B[:n])
 
                     completed.add((model_name, ckpt["checkpoint"], ab, layer_idx))
-                    for sim in sims:
-                        writer.writerow({
-                            "model":      model_name,
-                            "model_size": size_label,
-                            "checkpoint": ckpt["checkpoint"],
-                            "step":       ckpt["step"],
-                            "tokens":     ckpt["tokens"],
-                            "phrase_AB":  ab,
-                            "layer":      layer_idx,
-                            "cosine_sim": float(sim),
-                        })
+                    writer.writerow({
+                        "model":      model_name,
+                        "model_size": size_label,
+                        "checkpoint": ckpt["checkpoint"],
+                        "step":       ckpt["step"],
+                        "tokens":     ckpt["tokens"],
+                        "phrase_AB":  ab,
+                        "layer":      layer_idx,
+                        "cosine_sim": float(sims.mean()),
+                    })
 
                 out_file.flush()
             del all_reps
